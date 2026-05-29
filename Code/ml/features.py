@@ -61,6 +61,17 @@ FEATURE_COLS = [
     'd_atr_pct',            # daily ATR/close       : daily volatility regime
     'd_vol_ratio',          # daily volume/daily volMA20
     'd_return_20d',         # 20-trading-day return : monthly momentum
+    # ── Cross-sectional ranks (added 2026-05-29) ──────────────────────────
+    # Each rank is in [0,1]: 0 = weakest in universe at that bar, 1 = strongest.
+    # Captures relative strength dynamics: same absolute RSI means different
+    # things when most of the universe is also at that level.
+    'rs_rank_5d',           # rank of prior_5d_return vs all symbols at bar T
+    'rsi_rank',             # rank of RSI vs all symbols at bar T
+    'momentum_rank_20d',    # rank of d_return_20d vs all symbols at bar T
+    'vol_ratio_rank',       # rank of vol_ratio  vs all symbols at bar T
+    # ── Meta-feature: primary (rule-based) signal score ───────────────────
+    # Lets the secondary ML model condition on what the primary system says.
+    'primary_score',        # rule-based score 0-148 from compute_signal_score_col
 ]
 
 _WARMUP_BARS = 70          # 30-min bars to drop at start (indicator warmup)
@@ -418,9 +429,21 @@ def build_feature_matrix(df: pd.DataFrame,
         'low_raw':   low,
     }, index=df.index)
 
-    # Drop warmup rows, forward-fill FEATURE_COLS, zero-fill remainder
+    # Drop warmup rows and forward-fill features that exist at this stage.
     feat = feat.iloc[_WARMUP_BARS:].copy()
-    feat[FEATURE_COLS] = feat[FEATURE_COLS].ffill().fillna(0)
+    present_cols = [c for c in FEATURE_COLS if c in feat.columns]
+    feat[present_cols] = feat[present_cols].ffill().fillna(0)
+
+    # Cross-sectional rank features and primary_score are populated in
+    # build_all_features once all symbols are concatenated. For single-stock
+    # invocations (tests, inference adapters), seed them with neutral defaults
+    # so every call returns the full FEATURE_COLS surface.
+    for rank_col in ('rs_rank_5d', 'rsi_rank', 'momentum_rank_20d', 'vol_ratio_rank'):
+        if rank_col not in feat.columns:
+            feat[rank_col] = 0.5
+    if 'primary_score' not in feat.columns:
+        feat['primary_score'] = 0.0
+
     feat = feat.replace([np.inf, -np.inf], 0)
     return feat
 
@@ -468,7 +491,22 @@ def build_all_features(raw_bars=None, save: bool = True) -> pd.DataFrame:
         raise ValueError('[features] No data found for any symbol')
 
     combined = pd.concat(all_parts).sort_index()
-    combined  = attach_labels(combined)
+
+    # ── Cross-sectional rank features (computed across all symbols at each bar) ──
+    print('[features] Computing cross-sectional ranks across universe...')
+    combined = _add_cross_sectional_ranks(combined)
+
+    # ── Primary-signal meta-feature (rule-based score per row) ──
+    print('[features] Computing primary rule-based score as meta-feature...')
+    combined['primary_score'] = compute_signal_score_col(combined)
+
+    # Final pass: zero-fill any NaN in FEATURE_COLS (some symbols may have
+    # missing ranks if they're the only one trading at a given bar).
+    combined[FEATURE_COLS] = combined[FEATURE_COLS].fillna(0)
+    combined = combined.replace([np.inf, -np.inf], 0)
+
+    # ── Attach labels last (uses d_atr_pct for triple-barrier) ──
+    combined = attach_labels(combined)
 
     if save:
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -479,6 +517,38 @@ def build_all_features(raw_bars=None, save: bool = True) -> pd.DataFrame:
               f'TP rate {tp_rate:.1%} -> {ML_FEATURES_PATH}')
 
     return combined
+
+
+# ── Cross-sectional ranks ──────────────────────────────────────────────────
+
+def _add_cross_sectional_ranks(combined: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each timestamp T, compute the rank (in [0,1]) of each symbol's value
+    against all other symbols at that same bar. Captures relative-strength
+    dynamics across the universe.
+
+    pct=True returns rank/N normalized to [0,1]. Single-symbol bars get 0.5
+    (neutral). NaNs in the source column are excluded from ranking.
+    """
+    out = combined.copy()
+    rank_pairs = [
+        ('prior_5d_return', 'rs_rank_5d'),
+        ('rsi',             'rsi_rank'),
+        ('d_return_20d',    'momentum_rank_20d'),
+        ('vol_ratio',       'vol_ratio_rank'),
+    ]
+    # Use timestamp index as the groupby key; rank within each timestamp
+    for src, dst in rank_pairs:
+        if src not in out.columns:
+            out[dst] = 0.5
+            continue
+        out[dst] = (
+            out.groupby(level=0)[src]
+               .rank(pct=True, method='average')
+               .fillna(0.5)
+               .astype(float)
+        )
+    return out
 
 
 # ── Inference adapter ──────────────────────────────────────────────────────
@@ -591,4 +661,13 @@ def indicators_to_feature_row(
         'd_atr_pct':           d_atr_pct_val,
         'd_vol_ratio':         d_vol_ratio_val,
         'd_return_20d':        d_return_20d_val,
+        # Cross-sectional ranks — default to 0.5 (neutral) at inference time.
+        # In a multi-stock polling cycle, callers can fill these by ranking
+        # this bar's value vs all other stocks in the same cycle.
+        'rs_rank_5d':         float(indicators.get('rs_rank_5d',        0.5)),
+        'rsi_rank':           float(indicators.get('rsi_rank',          0.5)),
+        'momentum_rank_20d':  float(indicators.get('momentum_rank_20d', 0.5)),
+        'vol_ratio_rank':     float(indicators.get('vol_ratio_rank',    0.5)),
+        # Primary-signal meta-feature — caller injects via indicators dict.
+        'primary_score':      float(indicators.get('signal_score',     0.0)),
     }

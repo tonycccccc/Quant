@@ -17,8 +17,13 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT / 'Code'))
 
 from ml.features import FEATURE_COLS, build_feature_matrix, indicators_to_feature_row
-from ml.labels import generate_labels
-from ml.train import build_model, walk_forward_splits, walk_forward_cv
+from ml.labels import (
+    generate_labels, generate_labels_fixed, generate_labels_triple_barrier,
+)
+from ml.train import (
+    build_model, walk_forward_splits, walk_forward_cv,
+    compute_sample_weights,
+)
 
 
 # ── Synthetic data helpers ─────────────────────────────────────────────────
@@ -327,3 +332,94 @@ class TestPredict:
 
         row = {col: 0.0 for col in FEATURE_COLS}
         assert not mp.is_confident(row, threshold=0.6)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Triple-barrier label tests
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestTripleBarrier:
+    def test_returns_t1_and_ret_columns(self):
+        """generate_labels_fixed returns DataFrame with label, t1, ret columns."""
+        df  = _make_ohlcv(n=200)
+        out = generate_labels_fixed(df, timeout_bars=50)
+        for col in ('label', 't1', 'ret'):
+            assert col in out.columns, f'Missing column {col}'
+
+    def test_atr_scaled_barriers_set(self):
+        """Triple-barrier labels include the per-row tp_pct/sl_pct that were used."""
+        df = _make_ohlcv(n=200)
+        atr_pct = pd.Series(0.02, index=df.index)
+        out = generate_labels_triple_barrier(df, daily_atr_pct=atr_pct, timeout_bars=50)
+        for col in ('label', 't1', 'ret', 'tp_pct', 'sl_pct'):
+            assert col in out.columns, f'Missing column {col}'
+        valid = out['tp_pct'].dropna()
+        assert (valid > 0).all(), 'tp_pct must be positive'
+
+    def test_atr_scaling_higher_vol_wider_barriers(self):
+        """When daily_atr_pct is high, barriers widen."""
+        df = _make_ohlcv(n=200)
+        low_atr  = pd.Series(0.01, index=df.index)
+        high_atr = pd.Series(0.05, index=df.index)
+        low_out  = generate_labels_triple_barrier(df, daily_atr_pct=low_atr,  timeout_bars=50)
+        high_out = generate_labels_triple_barrier(df, daily_atr_pct=high_atr, timeout_bars=50)
+        # High-vol barriers must be at least as wide as low-vol ones (subject to clipping)
+        assert high_out['tp_pct'].dropna().mean() >= low_out['tp_pct'].dropna().mean()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Sample uniqueness weights
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestSampleWeights:
+    def test_weights_average_to_one(self):
+        """Normalized weights average to 1.0."""
+        n  = 100
+        ts = pd.date_range('2024-01-01', periods=n, freq='30min', tz='UTC')
+        df = pd.DataFrame({
+            'symbol': ['AAA'] * n,
+            't1':     [ts[min(i + 5, n - 1)] for i in range(n)],
+        }, index=ts)
+        w  = compute_sample_weights(df)
+        assert abs(w.mean() - 1.0) < 0.01, f'Weights should normalize to ~1.0, got {w.mean()}'
+
+    def test_weights_nonneg(self):
+        """All weights are non-negative."""
+        n  = 50
+        ts = pd.date_range('2024-01-01', periods=n, freq='30min', tz='UTC')
+        df = pd.DataFrame({
+            'symbol': ['AAA'] * n,
+            't1':     [ts[min(i + 3, n - 1)] for i in range(n)],
+        }, index=ts)
+        w = compute_sample_weights(df)
+        assert (w >= 0).all(), 'Weights must be non-negative'
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# New feature presence (rank features + primary_score)
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestNewFeatures:
+    def test_rank_features_in_FEATURE_COLS(self):
+        """Cross-sectional rank features and primary_score are in FEATURE_COLS."""
+        expected = ['rs_rank_5d', 'rsi_rank', 'momentum_rank_20d',
+                    'vol_ratio_rank', 'primary_score']
+        for col in expected:
+            assert col in FEATURE_COLS, f'{col} missing from FEATURE_COLS'
+
+    def test_inference_adapter_fills_ranks(self):
+        """indicators_to_feature_row returns rank values (default 0.5)."""
+        indicators = {
+            'close': 100.0, 'ema20': 99.0, 'ema50': 97.0,
+            'atr': 1.5, 'vwap': 99.5, 'volume': 2_000_000,
+            'volume_avg': 1_500_000, 'atr_contraction_ratio': 0.90,
+            'higher_highs': True, 'higher_lows': True,
+            'resistance': 99.0, 'vwap_hold': False,
+            'rsi': 55.0, 'macd_line': 0.0, 'macd_histogram': 0.0,
+        }
+        bar_df = _make_ohlcv(n=100)
+        from datetime import datetime
+        ts = datetime(2025, 3, 5, 10, 0)
+        row = indicators_to_feature_row(indicators, bar_df, ts)
+        for col in ('rs_rank_5d', 'rsi_rank', 'momentum_rank_20d', 'vol_ratio_rank'):
+            assert 0.0 <= row[col] <= 1.0, f'{col} out of [0,1]: {row[col]}'

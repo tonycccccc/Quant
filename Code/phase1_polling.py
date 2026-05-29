@@ -23,6 +23,16 @@ from config import (
 )
 import database as db
 import technicals as ta
+from ml.alert_log import log_alert
+from ml.features import indicators_to_feature_row
+
+try:
+    from ml.predict import predict_success_prob
+    _ML_AVAILABLE = True
+except Exception:
+    _ML_AVAILABLE = False
+    def predict_success_prob(feat):
+        return float('nan')
 
 ET = pytz.timezone('America/New_York')
 
@@ -232,6 +242,33 @@ def run_polling_cycle(
 
         print(f'  [{ticker}] Score={final_score:.1f}/100  '
               f'(base={base_score} x regime={regime_bias})  -> {label}')
+
+        # ── Alert logging: every score >= WATCH gets a training-data row ──
+        if final_score >= SIGNAL_WATCH_THRESHOLD:
+            try:
+                feat_row = indicators_to_feature_row(
+                    indicators, df, df.index[-1], rs_vs_qqq=rs,
+                )
+                ml_prob = predict_success_prob(feat_row) if _ML_AVAILABLE else None
+                clearance_today = db.get_today_clearance(ticker)
+                cleared_flag = bool(clearance_today and clearance_today.get('clearance'))
+                regime_mult = final_score / base_score if base_score > 0 else 1.0
+                log_alert(
+                    symbol=ticker,
+                    timestamp=df.index[-1],
+                    base_score=base_score,
+                    regime_multiplier=regime_mult,
+                    final_score=final_score,
+                    regime_bias=regime_bias,
+                    regime_confidence=regime_conf,
+                    ml_probability=ml_prob,
+                    cleared=cleared_flag,
+                    feature_row=feat_row,
+                    entry_price=indicators['close'],
+                    vix=vix,
+                )
+            except Exception as e:
+                print(f'  [{ticker}] alert_log failed: {e}')
 
         scored.append({
             'ticker':      ticker,

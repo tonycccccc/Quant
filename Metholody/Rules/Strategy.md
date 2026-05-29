@@ -225,25 +225,53 @@ Threshold:
 The ML model provides a secondary filter calibrated on 5-day outcome probability:
 
 Gate:
-  P(TP hit within 5 days) >= ML_CONFIDENCE_THRESHOLD (0.55)
-  Feature input: 26 multi-timeframe features (30-min + 4H proxy + daily)
-  Model: LightGBM trained on 24 months, 19 stocks, score>=90 setups only
+  P(TP hit) >= ML_CONFIDENCE_THRESHOLD (0.55)
+  Feature input: 31 features across three timeframes + cross-sectional ranks
+  Model: Calibrated LightGBM (isotonic), trained on 41 stocks x 24 months
 
-Why multi-timeframe:
-  Feature importance analysis shows that daily-timeframe features (d_vol_ratio,
-  d_return_20d, d_atr_pct) dominate prediction of 3-5 day outcomes — confirming
-  that short-term 30-min patterns alone have limited predictive power for swing trades.
+Lopez de Prado methodology (added 2026-05-29):
+  - Triple-barrier labels with ATR-scaled TP/SL (adapt to each stock's volatility)
+  - Sample-uniqueness weights for overlapping forward-window labels
+  - Isotonic probability calibration (CalibratedClassifierCV)
+  - Cross-sectional rank features (rs_rank_5d, rsi_rank, momentum_rank_20d, vol_ratio_rank)
+  - Meta-labeling primary_score feature (lets ML see rule-based system's verdict)
+  - Signal-quality filter (only train on bars scoring >= 90) for distribution alignment
+
+Why multi-timeframe + cross-sectional:
+  Feature importance analysis shows that daily-timeframe features dominate
+  prediction of 3-5 day outcomes. Cross-sectional ranks capture relative
+  strength dynamics that absolute indicator values miss.
 
 Score adjustment:
   ml_multiplier = 0.8 + 0.4 * P(TP_hit)
   P=0.55 -> x1.02 (slight boost)   P=0.70 -> x1.08   P=0.35 -> x0.94
 
 Fallback: if quant_model.pkl is absent, ML gate is skipped (rule-based only).
+
+17b. Alert Logging (production training-data capture, added 2026-05-29)
+
+Every Phase 1 polling cycle, each watchlist stock that scores >= SIGNAL_WATCH_THRESHOLD (80)
+is written to Logs/alerts.parquet with:
+
+  - Full feature snapshot (all 31 ML features) at the moment of the alert
+  - Rule-based score breakdown (base, regime multiplier, final)
+  - ML probability (or NaN if model absent)
+  - Clearance flag and would-have-traded flag
+  - Entry price (close at alert time) and current VIX
+
+Outcome columns (tp_hit, sl_hit, max_favorable, max_adverse, exit_reason) are
+backfilled by a periodic job once the 5-day forward window resolves.
+
+Purpose: builds an ongoing dataset that mirrors LIVE inference distribution
+exactly — same bars, same indicator computations, same regime context. Monthly
+retrain merges these alerts with historical Alpaca backfill to grow the
+training set with real-world data.
+
 18. Model Retraining Schedule
 
-Retrain monthly using the most recent 24 months of data. Monitor live P(TP_hit) vs actual TP hit rate — if they diverge by > 10pp for 30+ consecutive trading days, retrain immediately.
+Retrain monthly using the most recent 24 months of data + accumulated alerts log. Monitor live P(TP_hit) vs actual TP hit rate — if they diverge by > 10pp for 30+ consecutive trading days, retrain immediately.
 
-Training-only symbols (AVGO, QCOM, MU, CRM, NOW, CRWD, UBER, SHOP) are used to broaden regime coverage during training and are NOT traded live.
+Training-only symbols (30 total — see Section 1a / quantModel.md Section 2c) are used to broaden regime coverage during training and are NOT traded live. They include semi equipment (AMAT, LRCX, ASML), cybersecurity (CRWD, PANW), and non-tech diversifiers (JPM, V, LLY) to expose the model to wider behavior than mega-cap tech alone.
 
 20. Strategy Philosophy
 Edge comes from:

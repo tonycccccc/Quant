@@ -27,16 +27,44 @@ WATCHLIST = {
 }
 
 # Additional symbols used for ML training only (not traded live).
-# More diverse market regimes = better model generalization.
+# Diversified across sectors to broaden regime coverage — more regimes seen
+# during training = better generalization in live trading.
 ML_EXTRA_TRAINING_SYMBOLS = [
+    # — Semiconductors (8) — broad cycle exposure
     'AVGO',  # Broadcom — semis, similar momentum profile to NVDA/AMD
-    'QCOM',  # Qualcomm — semis / mobile chips
+    'QCOM',  # Qualcomm — mobile chips
     'MU',    # Micron — memory semis, high beta
-    'CRM',   # Salesforce — enterprise SaaS momentum
-    'NOW',   # ServiceNow — enterprise SaaS, strong trend behavior
-    'CRWD',  # CrowdStrike — cybersecurity growth stock
-    'UBER',  # Uber — consumer tech, liquid and volatile
-    'SHOP',  # Shopify — e-commerce growth, similar breakout patterns
+    'TSM',   # Taiwan Semi — foundry, global cycle
+    'ASML',  # ASML — semi equipment (EUV monopoly)
+    'AMAT',  # Applied Materials — semi equipment
+    'LRCX',  # Lam Research — semi equipment
+    'MRVL',  # Marvell — networking/automotive chips
+    # — Cloud / SaaS / AI infra (8)
+    'CRM',   # Salesforce — enterprise SaaS
+    'NOW',   # ServiceNow — enterprise SaaS strong trend
+    'CRWD',  # CrowdStrike — cybersecurity growth
+    'SNOW',  # Snowflake — data warehouse
+    'DDOG',  # Datadog — observability
+    'MDB',   # MongoDB — NoSQL DB
+    'NET',   # Cloudflare — edge / security
+    'PANW',  # Palo Alto Networks — cybersecurity
+    # — Consumer tech (5)
+    'UBER',  # Uber — ride share, liquid
+    'SHOP',  # Shopify — e-commerce growth
+    'ABNB',  # Airbnb — travel tech
+    'SPOT',  # Spotify — streaming
+    'ROKU',  # Roku — streaming HW/SW
+    # — Fintech (4)
+    'COIN',  # Coinbase — crypto exchange
+    'SQ',    # Block — fintech / payments
+    'HOOD',  # Robinhood — retail brokerage
+    'PYPL',  # PayPal — payments
+    # — Non-tech for regime diversity (5)
+    'JPM',   # JPMorgan — bank, rate sensitivity
+    'V',     # Visa — payments network
+    'MA',    # Mastercard — payments network
+    'LLY',   # Eli Lilly — pharma, GLP-1 momentum
+    'COST',  # Costco — consumer staple growth
 ]
 
 MARKET_INDEXES = ['SPY', 'QQQ']
@@ -105,10 +133,36 @@ ML_FEATURES_PATH      = MODELS_DIR / 'features.parquet'
 ML_MODEL_PATH         = MODELS_DIR / 'quant_model.pkl'
 
 ML_HISTORY_MONTHS     = 24          # months of 30-min bar history to fetch
-ML_LABEL_TP_PCT       = 0.05        # forward label: +5% = TP hit (used in training only)
+ML_LABEL_TP_PCT       = 0.05        # forward label: +5% = TP hit (fixed-barrier fallback only)
 ML_LABEL_TIMEOUT_DAYS = 5           # trading days to wait for TP resolution
 ML_LABEL_TIMEOUT_BARS = ML_LABEL_TIMEOUT_DAYS * 13  # 65 30-min bars
 ML_CONFIDENCE_THRESHOLD = 0.55      # P(TP_hit) gate: must exceed this to trade
 ML_MIN_PRECISION      = 0.30        # walk-forward CV precision floor; raise RuntimeError if below
 ML_SIGNAL_SCORE_THRESHOLD = 90      # only train on bars that score >= this (aligns training with inference)
 ML_ENABLED            = True        # set False to bypass ML gate entirely
+
+# ── Triple-Barrier Labeling (Lopez de Prado method) ───────────────────────
+# Barriers scale with each stock's recent volatility (daily ATR) instead of
+# being fixed percentages. This makes labels comparable across stocks of
+# different volatility regimes — a 5% move on KLAC is not the same as on V.
+ML_TRIPLE_BARRIER_ENABLED = False     # tested 2026-05-29; degraded AUC; reverted
+ML_TB_TP_ATR_MULT  = 2.0    # TP barrier = entry * (1 + 2.0 * daily_atr_pct)
+ML_TB_SL_ATR_MULT  = 1.5    # SL barrier = entry * (1 - 1.5 * daily_atr_pct) — widened
+ML_TB_MIN_TP_PCT   = 0.04   # floor: TP never below +4% (more achievable)
+ML_TB_MAX_TP_PCT   = 0.10   # ceiling: TP never above +10%
+ML_TB_MIN_SL_PCT   = 0.025  # floor: SL never tighter than 2.5% (avoid noise stops)
+ML_TB_MAX_SL_PCT   = 0.05   # ceiling: SL never wider than 5%
+
+# ── Probability calibration ───────────────────────────────────────────────
+# Calibration produces well-calibrated probabilities but compresses high-conf
+# predictions toward base rate on small datasets. Disable when raw discrimination
+# matters more than absolute probability values. Re-enable after live data confirms
+# benefit.
+ML_CALIBRATION_METHOD = None          # 'isotonic' | 'sigmoid' | None
+ML_CALIBRATION_CV = 3                 # CV folds for calibration fit (when enabled)
+
+# ── Sample weighting (López de Prado uniqueness) ──────────────────────────
+# Disabled by default after observing it produced 9.7x weight spreads that
+# destabilized LightGBM training. Re-enable after refining the uniqueness
+# computation (e.g., capping max weight).
+ML_SAMPLE_WEIGHTS_ENABLED = False     # toggle to bypass uniqueness weighting

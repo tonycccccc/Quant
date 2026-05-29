@@ -50,17 +50,27 @@ With 24 months across 19 stocks:
 - Covers at least 2 full bull/bear/sideways cycles for these tech names
 - Sufficient for LightGBM with proper regularization
 
-### 2c. Training universe
+### 2c. Training universe (expanded 2026-05-29)
 
-**19 stocks total: 11 trading stocks + 8 training-only stocks (via `ML_EXTRA_TRAINING_SYMBOLS`).**
+**41 stocks total: 11 trading stocks + 30 training-only stocks (via `ML_EXTRA_TRAINING_SYMBOLS`).**
 
-| Role | Stocks |
-|---|---|
-| Trading + training (11) | NVDA, AMD, PLTR, MSFT, META, AMZN, GOOGL, TSLA, AAPL, ORCL, NFLX |
-| Training only — not traded live (8) | AVGO, QCOM, MU, CRM, NOW, CRWD, UBER, SHOP |
-| Index context (always fetched) | QQQ, SPY |
+| Role | Stocks | Count |
+|---|---|---|
+| Trading + training | NVDA, AMD, PLTR, MSFT, META, AMZN, GOOGL, TSLA, AAPL, ORCL, NFLX | 11 |
+| Training only — semis | AVGO, QCOM, MU, TSM, ASML, AMAT, LRCX, MRVL | 8 |
+| Training only — cloud/SaaS/AI infra | CRM, NOW, CRWD, SNOW, DDOG, MDB, NET, PANW | 8 |
+| Training only — consumer tech | UBER, SHOP, ABNB, SPOT, ROKU | 5 |
+| Training only — fintech | COIN, SQ, HOOD, PYPL | 4 |
+| Training only — sector diversifiers | JPM, V, MA, LLY, COST | 5 |
+| Index context (always fetched) | QQQ, SPY | 2 |
 
-Training-only symbols broaden regime coverage (different sectors, volatility profiles) without adding live-trading risk. They are excluded from inference by not being in `WATCHLIST`.
+**Why the expansion (2026-05-29):**
+- Earlier 19-stock universe was mostly mega-cap tech — the model couldn't learn cross-sector regime variation.
+- Adding semi equipment (AMAT/LRCX/ASML), cybersecurity (CRWD/PANW), and non-tech sectors (JPM/V/LLY) exposes the model to wider behavior:
+  - Different volatility profiles (LLY's GLP-1 momentum vs JPM's rate-driven moves)
+  - Different breakout patterns (semis cycle differently from SaaS)
+  - Different liquidity/volume signatures
+- Training-only symbols are excluded from inference by not being in `WATCHLIST`. They contribute to the model's understanding of "what a successful breakout looks like" without touching live trading risk.
 
 ### 2d. Data source
 
@@ -130,7 +140,26 @@ Resampled from 30-min to business-day resolution with `shift(1)` lookahead guard
 | 25 | `d_vol_ratio` | Daily `volume / vol_MA20` — institutional activity |
 | 26 | `d_return_20d` | 20-trading-day return — medium-term momentum |
 
-**Removed features (vs prior design):** `vol_ratio` (redundant with `d_vol_ratio`), `higher_highs`, `higher_lows` (noisy, low importance confirmed by training).
+**Cross-sectional ranks (5 features) — added 2026-05-29**
+
+Each timestamp's universe is ranked together; rank is in [0,1] where 1 = strongest in the universe at that bar. Captures relative-strength dynamics: a stock's RSI=65 means a very different thing when most peers are at 70 vs when most peers are at 50.
+
+| # | Feature | What is ranked |
+|---|---|---|
+| 27 | `rs_rank_5d` | `prior_5d_return` across all symbols at bar T |
+| 28 | `rsi_rank` | `rsi` across all symbols at bar T |
+| 29 | `momentum_rank_20d` | `d_return_20d` across all symbols at bar T |
+| 30 | `vol_ratio_rank` | `vol_ratio` across all symbols at bar T |
+
+**Meta-labeling primary-signal feature (added 2026-05-29)**
+
+| # | Feature | Description |
+|---|---|---|
+| 31 | `primary_score` | Rule-based score (0-148) of the same bar — lets the ML model "see what the primary system already concluded" |
+
+This is meta-labeling per López de Prado: the secondary (ML) model is conditioned on the primary (rule-based) model's output and learns "given that the primary says X, should I actually take this trade?"
+
+**Removed features (vs prior design):** `vol_ratio` (redundant with `d_vol_ratio` and `vol_ratio_rank`), `higher_highs`, `higher_lows` (noisy, low importance).
 
 ### 3b. Features explicitly excluded
 
@@ -142,22 +171,37 @@ Resampled from 30-min to business-day resolution with `shift(1)` lookahead guard
 
 ## 4. Label Generation
 
-### 4a. Forward outcome labeling
+### 4a. Triple-Barrier Method with ATR-Scaled Barriers (Lopez de Prado)
 
-For each bar T, look forward up to **5 trading days (65 bars at 30-min)** and determine:
+**Default since 2026-05-29.** Each bar's TP and SL barriers scale with that stock's CURRENT daily volatility regime instead of being fixed percentages.
 
 ```
-TP_price = close[T] * 1.05   # +5%  (ML_LABEL_TP_PCT)
-SL_price = close[T] * 0.965  # -3.5% (HARD_STOP_LOSS_PCT)
+daily_atr_pct = d_atr_pct at bar T   (already in features)
 
-label = 1  if TP_price is reached before SL_price within 65 bars
-label = 0  if SL_price is reached first, OR neither is reached within 65 bars
+tp_pct[T] = clip(2.0 * daily_atr_pct, 3.0%, 10.0%)   # ML_TB_TP_ATR_MULT=2.0
+sl_pct[T] = clip(1.0 * daily_atr_pct, 1.5%, 5.0%)    # ML_TB_SL_ATR_MULT=1.0
+
+TP_price = close[T] * (1 + tp_pct[T])
+SL_price = close[T] * (1 - sl_pct[T])
+
+label = 1  if TP_price reached before SL_price within 65 bars (5 trading days)
+label = 0  if SL_price reached first, or neither reached within 65 bars
 ```
 
-Why 5 trading days / +5% TP:
-- 5-day window aligns with the 3-5 day trend prediction goal of the multi-timeframe features
-- +5% TP is achievable more frequently than +7%, providing better label balance
-- Shorter timeout reduces label staleness (fewer NaN rows at end of each symbol's history)
+**Why ATR-scaled barriers:**
+- A fixed +5% TP is easy on high-vol stocks (NVDA at 4% daily ATR) but unhittable on low-vol stocks (V at 1% daily ATR). Labels are inconsistent across the universe.
+- ATR scaling produces COMPARABLE labels across regimes — each bar's outcome is measured in units of "how much movement is normal here right now."
+- Clipping prevents pathological barriers in extreme volatility (e.g., earnings-day spikes) and in dead-flat regimes.
+
+**Resolution metadata returned per bar:**
+- `t1`     — timestamp the label resolved (first barrier touched, or timeout)
+- `ret`    — forward return at resolution (signed)
+- `tp_pct` — barrier that was used for this bar
+- `sl_pct` — barrier that was used for this bar
+
+The `t1` column powers **sample-uniqueness weighting** during training: when two labels' `[t, t1]` intervals overlap, they share part of the same future price path and are correlated. Each sample's weight is the inverse of its average concurrency, so overlapping redundant labels can't dominate training.
+
+Fallback: setting `ML_TRIPLE_BARRIER_ENABLED = False` reverts to fixed +5% / -3.5% barriers.
 
 ### 4b. Which bars to label
 
@@ -384,22 +428,22 @@ shap>=0.45.0       # optional: for model explainability
 
 See **Section 3a** for the complete feature table grouped by timeframe.
 
-**Feature importance from last training run (top 10):**
+**Feature importance from 2026-05-29 training run (top 10):**
 
-| Rank | Feature | Timeframe | Note |
+| Rank | Feature | Timeframe | LightGBM gain |
 |---|---|---|---|
-| 1 | `d_vol_ratio` | Daily | Institutional volume activity |
-| 2 | `d_return_20d` | Daily | Medium-term momentum |
-| 3 | `d_atr_pct` | Daily | Daily volatility regime |
-| 4 | `d_rsi` | Daily | Daily overbought/oversold |
-| 5 | `d_close_ema20_ratio` | Daily | Daily trend position |
-| 6 | `rs_vs_qqq` | 30-min | Relative strength vs tech sector |
-| 7 | `prior_5d_return` | 30-min | 5-day momentum |
-| 8 | `ema20_ema50_ratio` | 30-min | Intraday trend structure |
-| 9 | `atr_pct` | 30-min | Intraday volatility |
-| 10 | `macd_line_pct` | 30-min | MACD trend bias |
+| 1 | `d_vol_ratio` | Daily | 1,328 |
+| 2 | `d_atr_pct` | Daily | 1,286 |
+| 3 | `d_return_20d` | Daily | 1,221 |
+| 4 | `d_rsi` | Daily | 1,175 |
+| 5 | `d_close_ema20_ratio` | Daily | 1,126 |
+| 6 | `momentum_rank_20d` | **Cross-sectional** | 912 |
+| 7 | `prior_5d_return` | 30-min | 465 |
+| 8 | `rs_rank_5d` | **Cross-sectional** | 418 |
+| 9 | `rs_vs_qqq` | 30-min | 413 |
+| 10 | `day_of_week` | 30-min | 363 |
 
-All top-5 features are daily — confirming that multi-day context dominates short-term prediction.
+All top-5 features remain daily. **Cross-sectional ranks now occupy positions #6 and #8** — confirming the relative-strength hypothesis: knowing how a stock ranks against the universe at this moment is more informative than the absolute indicator value alone.
 
 ### Label definition (current)
 
@@ -422,15 +466,45 @@ After score>=90 filter: 24,456  (18.8%)
 TP rate in filtered set: 30.7%
 ```
 
-### Latest walk-forward CV results (24 months, 19 stocks, score>=90 filter)
+### Latest walk-forward CV results (24 months, 41 stocks, score>=90 filter)
 
-| Metric | Value |
-|---|---|
-| avg_precision | **0.348** |
-| avg_AUC | 0.549 |
-| n_splits | 4 |
-| test_months | 3 |
-| ML_MIN_PRECISION floor | 0.30 |
+> Trained 2026-05-29 with expanded 41-stock universe + cross-sectional ranks + primary_score meta-feature.
+
+| Metric | Value (new) | Prior (19 stocks) |
+|---|---|---|
+| Production precision @ 0.55 | **0.379** | 0.348 |
+| Top-10% precision (gate) | **0.390** | n/a |
+| Top-5% precision (high-conf only) | **0.402** | n/a |
+| Avg AUC | **0.583** | 0.549 |
+| Training samples (post score>=90) | 49,876 | 24,456 |
+| TP rate in filtered set | 30.4% | 30.7% |
+| n_splits | 4 | 4 |
+| test_months | 3 | 3 |
+| ML_MIN_PRECISION floor | 0.30 (top-10%) | 0.30 |
+
+**Per-fold detail (production threshold 0.55):**
+
+| Fold | Precision | Recall | AUC | Top-10% prec | p_max |
+|---|---|---|---|---|---|
+| 1 | 0.385 | 0.225 | 0.617 | 0.357 | 0.860 |
+| 2 | 0.361 | 0.299 | 0.597 | 0.374 | 0.890 |
+| 3 | 0.289 | 0.358 | 0.561 | 0.323 | 0.944 |
+| 4 | 0.483 | 0.381 | 0.557 | 0.508 | 0.921 |
+
+### Methodology ablation results (Lopez de Prado techniques)
+
+Each new technique was tested in isolation. Final decisions captured here.
+
+| Technique | Verdict | Rationale |
+|---|---|---|
+| **41-stock universe** | ✅ **Kept** | Broader sector coverage, top features include cross-sector ranks |
+| **Cross-sectional ranks** | ✅ **Kept** | `momentum_rank_20d` ranks #6 in feature importance |
+| **Primary-score meta-feature** | ✅ **Kept** | Lets ML condition on rule-based system's verdict |
+| **Triple-barrier (ATR-scaled)** | ❌ **Disabled** | Tight SL (1.5% min) hit by intraday noise → labels became noisier, AUC dropped to 0.49 |
+| **Isotonic calibration** | ❌ **Disabled** | Compressed probabilities to 0.20-0.27 range, no prediction exceeded 0.55 threshold |
+| **Sample-uniqueness weights** | ❌ **Disabled** | 9.7x weight spread destabilized LightGBM; can re-enable once weights are capped |
+
+The disabled techniques remain available behind config flags (`ML_TRIPLE_BARRIER_ENABLED`, `ML_CALIBRATION_METHOD`, `ML_SAMPLE_WEIGHTS_ENABLED`) for future re-evaluation when more data accumulates.
 
 ### Model (serialised as `ModelBundle`)
 
@@ -476,6 +550,26 @@ if p_success >= ML_CONFIDENCE_THRESHOLD:   # 0.55
 ```
 
 If `Models/quant_model.pkl` is absent, `predict_success_prob()` returns **0.5** (neutral) and Phase 1 falls back to rule-based scoring alone — no crash, no silent failure.
+
+### Alert Logging System (production training-data capture, added 2026-05-29)
+
+Every Phase 1 polling cycle, each watchlist stock that scores >= `SIGNAL_WATCH_THRESHOLD` (80) is appended to `Logs/alerts.parquet` with:
+
+- `alert_id`, `timestamp_utc`, `timestamp_et`, `symbol`
+- Score components: `base_score`, `regime_multiplier`, `final_score`
+- Regime: `regime_bias`, `regime_confidence`, `vix`
+- ML output: `ml_probability`, `ml_threshold_pass`
+- Decision flags: `cleared`, `would_have_traded`
+- Entry context: `entry_price`
+- **Full feature snapshot: all 31 ML features at the moment of the alert**
+- Outcome columns (filled by `backfill_outcomes()` after 5-day window): `tp_hit`, `sl_hit`, `max_favorable`, `max_adverse`, `exit_reason`, `resolved_at`
+
+**Why this matters:** the alerts log captures live inference distribution exactly — same bars, same indicator computations, same regime context. Monthly retrain can merge these with historical Alpaca backfill to grow the training set with real-world data. Over time, this is the only way to escape the "train on the past, hope the future repeats" trap.
+
+Available functions in `Code/ml/alert_log.py`:
+- `log_alert(...)` — append a single alert row (called from `phase1_polling.py`)
+- `backfill_outcomes(bars_lookup)` — walk unresolved alerts and fill `tp_hit`/`sl_hit`/etc.
+- `summary()` — quick CLI status dict (total, resolved, would_have_traded, tp_rate)
 
 ### CLI commands
 

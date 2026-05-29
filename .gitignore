@@ -13,6 +13,10 @@ trading.db
 
 # Logs (runtime output, not source)
 Logs/
+*.log
+
+# Claude Code memory artifacts (local state)
+memory/
 
 # Python
 __pycache__/
