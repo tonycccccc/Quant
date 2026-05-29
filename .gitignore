@@ -1,0 +1,37 @@
+# Secrets — never commit
+.env
+*.env
+.env.*
+
+# Generated data / model artifacts (re-run build-dataset + train-model to recreate)
+Models/raw_bars.parquet
+Models/features.parquet
+Models/quant_model.pkl
+
+# Database (contains live trading history)
+trading.db
+
+# Logs (runtime output, not source)
+Logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Claude Code internal
+.claude/
