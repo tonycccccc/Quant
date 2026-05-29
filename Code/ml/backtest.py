@@ -381,6 +381,133 @@ def run_backtest(use_ml: bool = True, starting_equity: float = 10_000.0) -> dict
     return results
 
 
+def run_oos_backtest(
+    train_months: int = 18,
+    starting_equity: float = 10_000.0,
+) -> dict:
+    """
+    Out-of-sample backtest: train a FRESH model on the first `train_months`
+    of the dataset, backtest on the remainder. The production model file is
+    NOT modified.
+
+    This is the honest read on whether the 58.6% in-sample win rate is real
+    predictive power or memorization of the training distribution.
+
+    Returns the same dict shape as run_backtest().
+    """
+    from ml.features import FEATURE_COLS, compute_signal_score_col
+    from ml.train import build_model, _wrap_calibrated, compute_recommended_threshold
+    from config import ML_SIGNAL_SCORE_THRESHOLD
+
+    print(f'\n[oos-backtest] Loading features from {ML_FEATURES_PATH}')
+    features = pd.read_parquet(ML_FEATURES_PATH)
+    raw_bars = pd.read_parquet(ML_RAW_BARS_PATH)
+
+    # Drop unlabeled rows and only train on bars that pass the signal filter
+    labeled = features[features['label'].notna()].copy()
+    labeled['label'] = labeled['label'].astype(int)
+    if 'primary_score' in labeled.columns:
+        signal_scores = labeled['primary_score']
+    else:
+        signal_scores = compute_signal_score_col(labeled)
+    labeled = labeled[signal_scores >= ML_SIGNAL_SCORE_THRESHOLD].copy()
+
+    # Temporal split
+    t_min = labeled.index.min()
+    t_max = labeled.index.max()
+    cutoff = t_min + pd.DateOffset(months=train_months)
+    if cutoff >= t_max:
+        raise RuntimeError(
+            f'train_months={train_months} >= total available history '
+            f'({(t_max - t_min).days / 30.4:.1f} months). Lower train_months.'
+        )
+
+    train_df = labeled[labeled.index < cutoff]
+    print(f'[oos-backtest] Train window: {t_min.date()} -> {cutoff.date()}  '
+          f'({len(train_df):,} labeled rows)')
+
+    # Train a fresh model (no calibration / weights — match production config)
+    tp_rate = float(train_df['label'].mean())
+    print(f'[oos-backtest] Training on {len(train_df):,} samples '
+          f'(TP rate {tp_rate:.1%})...')
+    base = build_model(tp_rate=tp_rate)
+    model = _wrap_calibrated(base, train_df[FEATURE_COLS], train_df['label'].to_numpy())
+
+    # Tune threshold on a holdout slice of training (NOT test) data
+    rec_thr, top10_thr, notes = compute_recommended_threshold(
+        model, train_df, train_df['label'], target_precision=0.50,
+    )
+    print(f'[oos-backtest] OOS-tuned threshold: {rec_thr:.3f}  ({notes})')
+
+    # Restrict features dataframe to the OOS window only AND watchlist tickers
+    oos_features = features[features.index >= cutoff].copy()
+    oos_features = oos_features[oos_features['symbol'].isin(WATCHLIST.keys())]
+    print(f'[oos-backtest] Test window:  {cutoff.date()} -> {t_max.date()}  '
+          f'({len(oos_features):,} rows, {oos_features["symbol"].nunique()} symbols)')
+
+    # Benchmarks over the OOS window only
+    qqq_ret = _benchmark_return(raw_bars.loc['QQQ'], cutoff, t_max) if 'QQQ' in raw_bars.index.get_level_values(0) else 0.0
+    spy_ret = _benchmark_return(raw_bars.loc['SPY'], cutoff, t_max) if 'SPY' in raw_bars.index.get_level_values(0) else 0.0
+    print(f'[oos-backtest] OOS benchmark — QQQ: {qqq_ret:+.2%}  |  SPY: {spy_ret:+.2%}')
+
+    def predict_fn(feature_row: dict) -> float:
+        row_df = pd.DataFrame([{c: feature_row.get(c, 0.0) for c in FEATURE_COLS}])
+        return float(model.predict_proba(row_df)[0][1])
+
+    # Rule-only on OOS window
+    print(f'\n[oos-backtest] Running rule_only variant on OOS window...')
+    rule_only = run_variant(oos_features, raw_bars, variant='rule_only',
+                              starting_equity=starting_equity)
+    rule_only.benchmark_return_qqq = qqq_ret
+    rule_only.benchmark_return_spy = spy_ret
+    _print_result(rule_only)
+
+    # Rule + ML on OOS window
+    print(f'\n[oos-backtest] Running rule_plus_ml variant on OOS window '
+          f'(threshold={rec_thr:.3f})...')
+    rule_plus_ml = run_variant(
+        oos_features, raw_bars, variant='rule_plus_ml',
+        ml_predict_fn=predict_fn,
+        ml_threshold=rec_thr,
+        starting_equity=starting_equity,
+    )
+    rule_plus_ml.benchmark_return_qqq = qqq_ret
+    rule_plus_ml.benchmark_return_spy = spy_ret
+    _print_result(rule_plus_ml)
+
+    # Write OOS trade ledger
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = LOGS_DIR / 'backtest_oos_trades.csv'
+    all_rows = []
+    for name, res in (('rule_only', rule_only), ('rule_plus_ml', rule_plus_ml)):
+        for t in res.trades:
+            all_rows.append({
+                'variant':      name,
+                'symbol':       t.symbol,
+                'entry_time':   t.entry_time.isoformat(),
+                'exit_time':    t.exit_time.isoformat(),
+                'entry_price':  round(t.entry_price, 2),
+                'exit_price':   round(t.exit_price, 2),
+                'shares':       t.shares,
+                'signal_score': round(t.signal_score, 1),
+                'ml_prob':      round(t.ml_prob, 4) if not np.isnan(t.ml_prob) else '',
+                'exit_reason':  t.exit_reason,
+                'pnl':          round(t.pnl, 2),
+                'pnl_pct':      round(t.pnl_pct, 4),
+            })
+    if all_rows:
+        pd.DataFrame(all_rows).to_csv(out_path, index=False)
+        print(f'\n[oos-backtest] OOS trade ledger -> {out_path}')
+
+    return {
+        'rule_only': rule_only,
+        'rule_plus_ml': rule_plus_ml,
+        'oos_threshold': rec_thr,
+        'train_months': train_months,
+        'cutoff_date': cutoff.date(),
+    }
+
+
 def _print_result(result: BacktestResult) -> None:
     print(f'  Variant:        {result.variant}')
     print(f'  Trades:         {result.n_trades}')

@@ -494,12 +494,34 @@ TP rate in filtered set: 30.7%
 | SPY buy-and-hold | — | — | +42.3% | — | — | -19.3% | baseline |
 
 **Caveats (in-sample, idealized):**
-- Backtest uses the same data the model was trained on. The walk-forward CV precision of ~0.37 at threshold 0.370 (which reaches 0.50 on holdout) is what's truly out-of-sample — and the 58.6% backtest win rate aligns with that.
+- Backtest uses the same data the model was trained on — see OOS section below for the honest read.
 - No slippage or commission modeled (Alpaca is commission-free but spread/slippage on market orders isn't zero).
 - No Pattern Day Trader rule (3+ same-day round-trips per week requires >=$25k equity).
 - Concurrent positions: backtest allows up to 11 (one per watchlist stock); live system caps at MAX_POSITIONS=5.
 
-The ML gate cuts trade count by 35% but raises win rate by 10 pp, profit factor from 1.22→1.89, and drops max drawdown by more than half.
+### Out-of-Sample Backtest (added 2026-05-29)
+
+Train on first 18 months, backtest on last 6 months. Fresh model, no leakage.
+
+CLI: `python Code/main.py oos-backtest --train-months 18`
+
+| Variant | OOS Trades | Win Rate | Total Return | Sharpe | Max DD | vs QQQ | vs SPY |
+|---|---|---|---|---|---|---|---|
+| Rule-only | 272 | 48.5% | +21.5% | 0.74 | -17.9% | **+0.6%** | +8.9% |
+| Rule + ML (thr 0.330) | 221 | 49.8% | +18.0% | 0.80 | -20.2% | -2.9% | +5.4% |
+| QQQ buy-and-hold | — | — | +20.9% | — | — | baseline | +8.2% |
+| SPY buy-and-hold | — | — | +12.6% | — | — | -8.2% | baseline |
+
+**Honest interpretation:**
+- The in-sample +453% / 58.6% win rate was substantially **overfit**. OOS the ML gate barely moves the win rate (48.5% → 49.8%).
+- Rule-only **just barely beats QQQ** (+0.6%) — marginal but positive. The rule-based strategy is real, if modest.
+- **The ML gate is currently NET-NEGATIVE OOS** (-2.9% vs QQQ vs rule-only's +0.6%). It's removing trades that would have been winners.
+- The 0.50 walk-forward CV precision is directionally honest but doesn't translate to outperformance in returns.
+
+**Implications for live deployment:**
+- Rule-only is the safer first ship — it's marginally better than buy-and-hold.
+- The ML gate needs more data and refinement before it earns its place in the pipeline. The alerts log will accumulate real distribution data; monthly retraining should help.
+- Don't expect to beat QQQ by a wide margin — the realistic target is to track QQQ with **lower drawdowns** during corrections (the strategy is regime-gated and shouldn't be fully invested in bear regimes).
 
 **Per-fold detail (production threshold 0.55):**
 

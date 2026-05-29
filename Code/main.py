@@ -150,6 +150,12 @@ def cmd_backtest(args):
     run_backtest(use_ml=not args.no_ml, starting_equity=args.equity)
 
 
+def cmd_oos_backtest(args):
+    """Train on first N months, backtest on the remainder. True OOS read."""
+    from ml.backtest import run_oos_backtest
+    run_oos_backtest(train_months=args.train_months, starting_equity=args.equity)
+
+
 def cmd_run(args):
     """
     Full pipeline:
@@ -248,6 +254,13 @@ def build_parser() -> argparse.ArgumentParser:
     pbt.add_argument('--no-ml', action='store_true',
                      help='Skip the rule+ML variant (rule-only baseline)')
 
+    poos = sub.add_parser('oos-backtest',
+                          help='True OOS: train on first N months, backtest on the rest')
+    poos.add_argument('--train-months', type=int, default=18, dest='train_months',
+                      help='Months of history to train on; rest becomes the OOS test (default: 18)')
+    poos.add_argument('--equity', type=float, default=10_000.0,
+                      help='Starting equity for the simulation (default: $10,000)')
+
     return p
 
 
@@ -266,6 +279,7 @@ def main():
         'build-dataset': cmd_build_dataset,
         'train-model':   cmd_train_model,
         'backtest':      cmd_backtest,
+        'oos-backtest':  cmd_oos_backtest,
     }
 
     handler = dispatch.get(args.command)
