@@ -129,16 +129,21 @@ Risk per trade:
 1.5% of total equity max loss per position
 Position Size Formula:
 shares = (equity * 0.015) / stop_loss_distance
-9. Stop Loss Logic (STRUCTURAL, NOT FIXED %)
+9. Stop Loss Logic (ATR-AWARE STRUCTURAL, updated 2026-05-29)
 
-Stop is placed at:
+Stop placement:
+  base_distance = max(STRUCTURAL_STOP_MIN_DISTANCE (1%), 1.5 * daily_ATR_pct)
+  atr_stop      = entry * (1 - base_distance)
+  if VWAP is below atr_stop:
+      stop = VWAP
+  else:
+      stop = atr_stop
+  stop = max(stop, hard_floor)   # never wider than HARD_STOP_LOSS_PCT (-3.5%)
 
-below VWAP reclaim zone OR
-below breakout base OR
--3.5% max hard cap
-Rule:
-
-whichever is tighter but not too tight to cause noise stop-outs
+Why ATR-aware:
+  - NVDA at 3% daily ATR -> 1.5 * 3% = 4.5%, clamped to 3.5% hard floor
+  - V    at 1% daily ATR -> 1.5 * 1% = 1.5%, ample headroom for normal noise
+  - Previous fixed-1% stops were getting noise-stopped on high-vol names
 
 10. Take Profit Logic (SCALING EXIT)
 Tiered Exit:

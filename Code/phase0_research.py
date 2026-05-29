@@ -42,13 +42,21 @@ DAMAGE_KEYWORDS = [
 
 def _get_next_earnings(ticker_obj: yf.Ticker) -> tuple:
     """
-    Returns (next_earnings_date, days_away).
-    Returns (None, None) if no earnings data is found.
+    Returns (next_earnings_date, days_away, fetch_ok).
+
+    fetch_ok=False indicates a network/yfinance failure — callers should
+    treat the symbol as BLOCKED rather than CLEARED, since we can't rule
+    out an imminent earnings event.
+
+    fetch_ok=True with (None, None) means yfinance returned data but no
+    upcoming earnings date is listed.
     """
     try:
         cal = ticker_obj.calendar
         if cal is None:
-            return None, None
+            # Yfinance returned no calendar — could mean "no earnings" OR
+            # "stale data". Treat as ambiguous, but fetch itself succeeded.
+            return None, None, True
 
         dates = []
         if isinstance(cal, dict):
@@ -60,7 +68,7 @@ def _get_next_earnings(ticker_obj: yf.Ticker) -> tuple:
             dates = list(val) if hasattr(val, '__iter__') else [val]
 
         if not dates:
-            return None, None
+            return None, None, True
 
         now = datetime.now(ET)
         for d in dates:
@@ -71,10 +79,11 @@ def _get_next_earnings(ticker_obj: yf.Ticker) -> tuple:
                 ts = ts.tz_convert('America/New_York')
             days_away = (ts.date() - now.date()).days
             if days_away >= 0:
-                return ts, days_away
-    except Exception:
-        pass
-    return None, None
+                return ts, days_away, True
+        return None, None, True
+    except Exception as e:
+        print(f'    [earnings] yfinance fetch failed: {e}')
+        return None, None, False
 
 
 def _get_analyst_signal(ticker_obj: yf.Ticker) -> tuple:
@@ -140,9 +149,16 @@ def _evaluate_clearance(ticker: str, company: str) -> tuple:
     key_catalyst  = 'No significant catalyst'
     notes         = []
 
-    # ── 1. Earnings veto ──────────────────────────────────────────────────
-    earnings_date, days_away = _get_next_earnings(ticker_obj)
-    if earnings_date is not None:
+    # ── 1. Earnings veto — FAIL-SAFE if fetch failed ─────────────────────
+    earnings_date, days_away, fetch_ok = _get_next_earnings(ticker_obj)
+    if not fetch_ok:
+        # Cannot confirm there is NOT an earnings event within 3 days.
+        # Block trading until we have data — real money at stake.
+        clearance     = 0
+        earnings_risk = True
+        key_catalyst  = 'Earnings fetch failed — BLOCKED until next pre-market run'
+        notes.append('SAFETY: earnings data unavailable, blocking by default')
+    elif earnings_date is not None:
         label = f"Earnings: {earnings_date.strftime('%Y-%m-%d')} ({days_away}d away)"
         notes.append(label)
         if days_away <= 3:
@@ -150,7 +166,7 @@ def _evaluate_clearance(ticker: str, company: str) -> tuple:
             earnings_risk = True
             key_catalyst  = f"Earnings in {days_away} trading day(s) — DO NOT TRADE"
     else:
-        notes.append('Earnings: date unavailable')
+        notes.append('Earnings: no upcoming date in calendar')
 
     # ── 2. Macro event veto ───────────────────────────────────────────────
     is_macro, macro_desc = is_macro_event_day()

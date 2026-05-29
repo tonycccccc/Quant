@@ -144,6 +144,12 @@ def cmd_train_model(args):
     run_training_pipeline(min_precision=args.min_precision)
 
 
+def cmd_backtest(args):
+    """Simulate rule-only vs rule+ML against SPY/QQQ buy-and-hold."""
+    from ml.backtest import run_backtest
+    run_backtest(use_ml=not args.no_ml, starting_equity=args.equity)
+
+
 def cmd_run(args):
     """
     Full pipeline:
@@ -235,6 +241,13 @@ def build_parser() -> argparse.ArgumentParser:
     ptm.add_argument('--min-precision', type=float, default=0.50, dest='min_precision',
                      help='Minimum CV precision to allow saving the model (default: 0.50)')
 
+    pbt = sub.add_parser('backtest',
+                         help='Simulate rule-only and rule+ML vs SPY/QQQ buy-and-hold')
+    pbt.add_argument('--equity', type=float, default=10_000.0,
+                     help='Starting equity for the simulation (default: $10,000)')
+    pbt.add_argument('--no-ml', action='store_true',
+                     help='Skip the rule+ML variant (rule-only baseline)')
+
     return p
 
 
@@ -252,6 +265,7 @@ def main():
         'run':           cmd_run,
         'build-dataset': cmd_build_dataset,
         'train-model':   cmd_train_model,
+        'backtest':      cmd_backtest,
     }
 
     handler = dispatch.get(args.command)

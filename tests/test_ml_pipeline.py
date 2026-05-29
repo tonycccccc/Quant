@@ -423,3 +423,97 @@ class TestNewFeatures:
         row = indicators_to_feature_row(indicators, bar_df, ts)
         for col in ('rs_rank_5d', 'rsi_rank', 'momentum_rank_20d', 'vol_ratio_rank'):
             assert 0.0 <= row[col] <= 1.0, f'{col} out of [0,1]: {row[col]}'
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Safety / fail-safe tests (real-money correctness)
+# ══════════════════════════════════════════════════════════════════════════
+
+class TestATRStop:
+    def test_high_vol_stock_gets_wider_stop(self):
+        """High daily ATR -> stop further from entry, not noise-tight."""
+        from phase2_execution import PortfolioManager
+        pm = PortfolioManager.__new__(PortfolioManager)
+        # Low-vol stock: d_atr_pct = 0.01 -> stop = 1.5%
+        low_stop = pm._compute_stop(entry_price=100.0, vwap=0, d_atr_pct=0.01)
+        # High-vol stock: d_atr_pct = 0.04 -> 1.5*4% = 6%, clamped to 3.5%
+        high_stop = pm._compute_stop(entry_price=100.0, vwap=0, d_atr_pct=0.04)
+        assert high_stop < low_stop, \
+            f'High-vol stop ({high_stop}) should be deeper than low-vol stop ({low_stop})'
+
+    def test_hard_floor_respected(self):
+        """Stop never wider than HARD_STOP_LOSS_PCT regardless of ATR."""
+        from phase2_execution import PortfolioManager
+        from config import HARD_STOP_LOSS_PCT
+        pm = PortfolioManager.__new__(PortfolioManager)
+        # Pathological ATR
+        stop = pm._compute_stop(entry_price=100.0, vwap=0, d_atr_pct=0.20)
+        min_allowed = 100.0 * (1 - HARD_STOP_LOSS_PCT)
+        assert stop >= min_allowed - 0.01, \
+            f'Stop {stop} should not be wider than hard floor {min_allowed}'
+
+    def test_vwap_used_when_below_atr_stop(self):
+        """When VWAP is below the ATR-derived stop, prefer VWAP."""
+        from phase2_execution import PortfolioManager
+        pm = PortfolioManager.__new__(PortfolioManager)
+        # entry=100, ATR-derived stop = 98.5, VWAP=98.0 (deeper) -> use VWAP
+        stop = pm._compute_stop(entry_price=100.0, vwap=98.0, d_atr_pct=0.01)
+        assert stop == 98.0
+
+
+class TestProductionThreshold:
+    def test_get_threshold_with_bundle(self, tmp_path, monkeypatch):
+        """get_threshold uses bundle.recommended_threshold when present."""
+        import ml.predict as mp
+        from ml.train import ModelBundle
+
+        bundle = ModelBundle(
+            model=None, feature_cols=FEATURE_COLS,
+            trained_at='2026-01-01', n_samples=100, tp_rate=0.3,
+            recommended_threshold=0.42,
+        )
+        monkeypatch.setattr(mp, '_bundle', bundle)
+        assert mp.get_threshold() == 0.42
+
+    def test_get_threshold_explicit_override(self, tmp_path, monkeypatch):
+        """Caller can override the bundle threshold."""
+        import ml.predict as mp
+        from ml.train import ModelBundle
+
+        bundle = ModelBundle(
+            model=None, feature_cols=FEATURE_COLS,
+            trained_at='2026-01-01', n_samples=100, tp_rate=0.3,
+            recommended_threshold=0.42,
+        )
+        monkeypatch.setattr(mp, '_bundle', bundle)
+        assert mp.get_threshold(0.99) == 0.99
+
+    def test_get_threshold_static_fallback(self, tmp_path, monkeypatch):
+        """When no bundle exists, falls back to static config value."""
+        import ml.predict as mp
+        from config import ML_CONFIDENCE_THRESHOLD
+        monkeypatch.setattr(mp, '_bundle', None)
+        monkeypatch.setattr(mp, 'ML_MODEL_PATH', tmp_path / 'no_model.pkl')
+        assert mp.get_threshold() == ML_CONFIDENCE_THRESHOLD
+
+
+class TestPrimaryScoreParity:
+    def test_default_skips_regime_multiplier(self):
+        """compute_signal_score_col returns base score by default (no regime)."""
+        from ml.features import compute_signal_score_col
+        # Build a tiny synthetic feature df
+        df = pd.DataFrame({
+            'close_ema20_ratio': [0.01], 'ema20_ema50_ratio': [0.02],
+            'close_vwap_ratio':  [0.005], 'close_resist_ratio': [0.01],
+            'rsi':               [60.0], 'macd_hist_pct':      [0.001],
+            'macd_line_pct':     [0.001], 'vwap_hold':         [1.0],
+            'rs_vs_qqq':         [0.03], 'vol_ratio':          [2.0],
+            'higher_highs':      [1.0], 'higher_lows':         [1.0],
+            'spy_ema_aligned':   [1.0], 'qqq_ema_aligned':     [1.0],
+        }, index=pd.date_range('2024-01-01', periods=1, freq='30min', tz='UTC'))
+        base   = compute_signal_score_col(df, apply_regime=False)
+        regime = compute_signal_score_col(df, apply_regime=True)
+        # Bullish regime should be >= base
+        assert regime.iloc[0] >= base.iloc[0]
+        # Specifically: 1.10x multiplier when both EMAs aligned
+        assert abs(regime.iloc[0] - base.iloc[0] * 1.10) < 0.5

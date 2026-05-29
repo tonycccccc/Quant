@@ -50,6 +50,14 @@ class ModelBundle:
     cv_metrics:   list = field(default_factory=list)
     calibrated:   bool = False
     method:       str  = 'lightgbm'
+    # Production decision thresholds derived from CV — see compute_thresholds().
+    # `recommended_threshold` is what predict.is_confident() should compare against
+    # by default. It targets `target_precision` (default 0.50) on the most recent
+    # CV fold using the actual probability distribution this model produces.
+    recommended_threshold: float = 0.55
+    target_precision:      float = 0.50
+    top_decile_threshold:  float = 0.5    # threshold of top-10% predicted probs
+    threshold_notes:       str   = ''
 
 
 # ── Model factory ─────────────────────────────────────────────────────────
@@ -268,6 +276,56 @@ def walk_forward_cv(
 
 # ── Final model training ───────────────────────────────────────────────────
 
+def compute_recommended_threshold(
+    model,
+    X: pd.DataFrame,
+    y: pd.Series,
+    target_precision: float = 0.50,
+) -> tuple[float, float, str]:
+    """
+    Scan thresholds on a held-out slice (last 20% of training data) and pick
+    the one that achieves >= target_precision with maximum recall.
+
+    Returns (recommended_threshold, top_decile_threshold, notes_string).
+
+    This is what `predict.is_confident()` should use in production. It replaces
+    the static ML_CONFIDENCE_THRESHOLD — every time we retrain, the model's
+    probability distribution might shift, so the threshold must shift with it.
+    """
+    from sklearn.metrics import precision_score
+
+    n   = len(X)
+    cut = int(n * 0.8)
+    X_holdout = X.iloc[cut:][FEATURE_COLS]
+    y_holdout = y.iloc[cut:].to_numpy()
+    if len(X_holdout) < 100:
+        return 0.55, 0.5, 'holdout too small — using static 0.55 default'
+
+    y_prob = model.predict_proba(X_holdout)[:, 1]
+
+    # Scan thresholds at 1% granularity. Pick the LOWEST threshold that hits
+    # target_precision (gives best recall). Fall back to top-decile if target
+    # is unreachable on this dataset.
+    best_thresh = None
+    for thr in np.linspace(0.1, 0.95, 86):
+        y_pred = (y_prob >= thr).astype(int)
+        if y_pred.sum() < max(20, len(y_holdout) * 0.005):
+            continue   # too few positives to be reliable
+        prec = precision_score(y_holdout, y_pred, zero_division=0)
+        if prec >= target_precision:
+            best_thresh = float(thr)
+            break
+
+    top_decile_threshold = float(np.quantile(y_prob, 0.90))
+    if best_thresh is None:
+        notes = (f'target precision {target_precision:.2f} unreachable on '
+                 f'holdout; using top-decile threshold')
+        return top_decile_threshold, top_decile_threshold, notes
+
+    notes = f'threshold {best_thresh:.3f} achieves >= {target_precision:.2f} precision on holdout'
+    return best_thresh, top_decile_threshold, notes
+
+
 def train_final_model(
     X: pd.DataFrame,
     y: pd.Series,
@@ -282,6 +340,15 @@ def train_final_model(
     model   = _wrap_calibrated(base, X[FEATURE_COLS], y.to_numpy(),
                                 sample_weight=sample_weights)
 
+    # Pick a production threshold tuned to the actual probability distribution
+    # this model produces. Replaces the static ML_CONFIDENCE_THRESHOLD.
+    rec_thr, top10_thr, notes = compute_recommended_threshold(
+        model, X, y, target_precision=0.50,
+    )
+    print(f'[train] Recommended production threshold: {rec_thr:.3f}  '
+          f'(top-10% threshold: {top10_thr:.3f})')
+    print(f'         {notes}')
+
     bundle = ModelBundle(
         model=model,
         feature_cols=FEATURE_COLS,
@@ -291,6 +358,10 @@ def train_final_model(
         cv_metrics=cv_metrics,
         calibrated=ML_CALIBRATION_METHOD is not None,
         method=type(base).__name__,
+        recommended_threshold=rec_thr,
+        target_precision=0.50,
+        top_decile_threshold=top10_thr,
+        threshold_notes=notes,
     )
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)

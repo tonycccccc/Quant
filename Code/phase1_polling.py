@@ -37,6 +37,88 @@ except Exception:
 ET = pytz.timezone('America/New_York')
 
 
+# ── Cross-sectional rank helpers ──────────────────────────────────────────
+
+def _compute_live_daily_feature(df: pd.DataFrame, kind: str) -> float:
+    """
+    Compute one daily-timeframe value for ranking purposes from the live 30-min
+    bar_df. Mirrors the resample logic in ml/features._compute_daily_features
+    but returns a single scalar (latest available daily bar).
+
+    Used to populate ranks; the actual feature_row daily values come from
+    indicators_to_feature_row which uses the same resample.
+    """
+    if df is None or len(df) < 100:
+        return 0.0
+    idx_et = df.index.tz_convert('America/New_York') if df.index.tz else df.index
+    daily = df.copy()
+    daily.index = idx_et
+    by_day = daily.resample('B').agg(close=('close', 'last')).dropna()
+    if len(by_day) < 21:
+        return 0.0
+    if kind == 'd_return_20d':
+        return float(by_day['close'].iloc[-1] / by_day['close'].iloc[-21] - 1)
+    return 0.0
+
+
+def _inject_cross_sectional_ranks(raw_indicators: dict) -> None:
+    """
+    Compute pct-ranks across all in-flight watchlist tickers and write them
+    back into each ticker's indicators dict.
+
+    Mirrors training-time _add_cross_sectional_ranks: pandas rank(pct=True)
+    across symbols at the same bar. Mutates raw_indicators in place.
+
+    Ranked fields:
+      - prior_5d_return  -> rs_rank_5d         (proxy from 30-min bar history)
+      - rsi              -> rsi_rank
+      - d_return_20d     -> momentum_rank_20d
+      - vol_ratio        -> vol_ratio_rank
+    """
+    import pandas as pd
+    if not raw_indicators:
+        return
+
+    rows = []
+    tickers = []
+    for ticker, (indicators, df, rs) in raw_indicators.items():
+        bar_close = df['close']
+        prior_5d = float(bar_close.iloc[-1] / bar_close.iloc[-66] - 1) \
+                   if len(bar_close) >= 66 else 0.0
+        vol_ratio = (indicators.get('volume', 0.0) /
+                     indicators['volume_avg']) if indicators.get('volume_avg', 0) > 0 else 1.0
+        d_return_20d = _compute_live_daily_feature(df, 'd_return_20d')
+        rows.append({
+            'prior_5d_return': prior_5d,
+            'rsi':             float(indicators.get('rsi', 50.0)),
+            'd_return_20d':    d_return_20d,
+            'vol_ratio':       float(vol_ratio),
+        })
+        tickers.append(ticker)
+
+    if len(rows) < 2:
+        # With <2 tickers, ranks aren't meaningful. Leave defaults (0.5).
+        for ticker in tickers:
+            indicators, _, _ = raw_indicators[ticker]
+            indicators.setdefault('rs_rank_5d', 0.5)
+            indicators.setdefault('rsi_rank', 0.5)
+            indicators.setdefault('momentum_rank_20d', 0.5)
+            indicators.setdefault('vol_ratio_rank', 0.5)
+        return
+
+    cross = pd.DataFrame(rows, index=tickers)
+    rank_map = {
+        'prior_5d_return': 'rs_rank_5d',
+        'rsi':             'rsi_rank',
+        'd_return_20d':    'momentum_rank_20d',
+        'vol_ratio':       'vol_ratio_rank',
+    }
+    for src, dst in rank_map.items():
+        ranks = cross[src].rank(pct=True, method='average').fillna(0.5)
+        for ticker, val in ranks.items():
+            raw_indicators[ticker][0][dst] = float(val)
+
+
 # ── Market-hours helpers ───────────────────────────────────────────────────
 
 def is_market_hours() -> bool:
@@ -166,7 +248,14 @@ def run_polling_cycle(
             return []
 
     all_tickers = list(WATCHLIST.keys()) + MARKET_INDEXES
-    days_back   = 15   # needs 55+ bars for EMA-50 warmup; 15 days covers ~100 bars
+    # 90 calendar days ~= 63 business days. Required to populate ALL daily
+    # features in indicators_to_feature_row():
+    #   - d_ema_aligned needs ~50 daily bars (EMA-50)
+    #   - d_return_20d / d_vol_ratio need 20 daily bars
+    #   - 30-min EMA-50 needs ~55 bars (covered comfortably by 63 days * 13)
+    # Without this, daily features (top 5 by importance) silently default to 0
+    # at inference, creating a major train/inference mismatch.
+    days_back = 90
     print(f'[Alpaca] Fetching {days_back}-day 30-min bars for: {", ".join(all_tickers)}')
 
     all_bars = fetch_bars(all_tickers, days_back=days_back)
@@ -174,14 +263,20 @@ def run_polling_cycle(
     spy_df = all_bars.get('SPY', pd.DataFrame())
     qqq_df = all_bars.get('QQQ', pd.DataFrame())
 
-    # ── VIX hard block ─────────────────────────────────────────────────────
+    # ── VIX hard block (FAIL-SAFE: unknown VIX = no trade) ─────────────────
+    vix = None
     try:
         import yfinance as yf
         vix_hist = yf.Ticker('^VIX').history(period='2d')
-        vix = float(vix_hist['Close'].iloc[-1]) if not vix_hist.empty else 0.0
+        if not vix_hist.empty:
+            vix = float(vix_hist['Close'].iloc[-1])
     except Exception as e:
-        print(f'  [VIX] Could not fetch VIX: {e} — proceeding without block')
-        vix = 0.0
+        print(f'  [VIX] Fetch failed: {e}')
+
+    if vix is None:
+        print('[Phase 1] VIX UNKNOWN — refusing to trade (fail-safe). '
+              'Check yfinance / network before live trading.')
+        return []
 
     print(f'  VIX = {vix:.1f}')
     if vix >= VIX_HARD_BLOCK:
@@ -212,7 +307,9 @@ def run_polling_cycle(
     qqq_ema_aligned = int(_ind_qqq['ema20'] > _ind_qqq['ema50']) if _ind_qqq else 0
 
     # ── Score each watchlist ticker ────────────────────────────────────────
+    # Pass 1: compute indicators + base score for every ticker
     scored = []
+    raw_indicators = {}   # ticker -> indicators dict (mutable, ranks added in pass 2)
     for ticker in WATCHLIST:
         df = all_bars.get(ticker)
         if df is None or len(df) < 55:
@@ -225,16 +322,26 @@ def run_polling_cycle(
             continue
 
         rs = ta.compute_rs_vs_qqq(df, qqq_df) if len(qqq_df) >= 10 else 0.0
-        base_score, components = ta.score_signal(indicators, rs)
-        final_score = ta.apply_regime_multiplier(base_score, regime_bias, regime_conf)
-
         indicators.update({
             'rs_vs_qqq':        round(rs, 4),
             'regime_bias':      regime_bias,
-            'signal_score':     round(final_score, 1),
             'spy_ema_aligned':  spy_ema_aligned,
             'qqq_ema_aligned':  qqq_ema_aligned,
         })
+        raw_indicators[ticker] = (indicators, df, rs)
+
+    # ── Cross-sectional ranks across all in-flight watchlist tickers ──────
+    # Mirrors the training-time rank computation in features.py so the ML model
+    # sees real rank values, not the 0.5 default. Without this, momentum_rank_20d
+    # (#6 feature by importance) is dead at inference.
+    _inject_cross_sectional_ranks(raw_indicators)
+
+    # Pass 2: finalize scores and ML-feature-row construction
+    for ticker, (indicators, df, rs) in raw_indicators.items():
+        base_score, components = ta.score_signal(indicators, rs)
+        final_score = ta.apply_regime_multiplier(base_score, regime_bias, regime_conf)
+        indicators['signal_score']       = round(final_score, 1)
+        indicators['primary_base_score'] = round(base_score, 1)   # train/inference parity for ML primary_score feature
 
         label = '🟢 BUY SIGNAL' if final_score >= SIGNAL_BUY_THRESHOLD \
             else '🟡 WATCH' if final_score >= SIGNAL_WATCH_THRESHOLD \

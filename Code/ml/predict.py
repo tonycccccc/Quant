@@ -67,9 +67,33 @@ def predict_success_prob(feature_row: dict) -> float:
         return 0.5
 
 
-def is_confident(feature_row: dict, threshold: float = ML_CONFIDENCE_THRESHOLD) -> bool:
-    """Return True if P(success) >= threshold (default ML_CONFIDENCE_THRESHOLD)."""
-    return predict_success_prob(feature_row) >= threshold
+def get_threshold(threshold: float = None) -> float:
+    """
+    Return the production decision threshold.
+
+    Priority:
+      1. Explicit `threshold` argument (caller override)
+      2. ModelBundle.recommended_threshold (per-model, tuned during training)
+      3. ML_CONFIDENCE_THRESHOLD from config (last-resort static default)
+
+    The bundle threshold is the one to trust: every retrain re-tunes it to
+    target a precision of 0.50 on the most recent holdout. The static config
+    value only kicks in when the model file is missing or pre-dates this field.
+    """
+    if threshold is not None:
+        return threshold
+    bundle = load_model()
+    if bundle is not None and getattr(bundle, 'recommended_threshold', None) is not None:
+        return float(bundle.recommended_threshold)
+    return ML_CONFIDENCE_THRESHOLD
+
+
+def is_confident(feature_row: dict, threshold: float = None) -> bool:
+    """
+    Return True if P(success) >= the production threshold.
+    Pass an explicit threshold to override the model's recommended value.
+    """
+    return predict_success_prob(feature_row) >= get_threshold(threshold)
 
 
 def model_info() -> Optional[dict]:

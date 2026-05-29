@@ -80,16 +80,25 @@ _INDEX_TICKERS = {'QQQ', 'SPY'}
 
 # ── Signal-quality score (mirrors technicals.score_signal) ────────────────
 
-def compute_signal_score_col(feat_df: pd.DataFrame) -> pd.Series:
+def compute_signal_score_col(feat_df: pd.DataFrame,
+                              apply_regime: bool = False) -> pd.Series:
     """
     Reconstruct the rule-based signal score vectorially from feature columns.
-    Mirrors technicals.score_signal() + apply_regime_multiplier() exactly.
+    Mirrors technicals.score_signal(); regime multiplier optional.
 
     Uses vol_ratio / higher_highs / higher_lows from the parquet (they are
     computed in build_feature_matrix but excluded from FEATURE_COLS).
 
+    Parameters
+    ----------
+    apply_regime : when True, applies a 0.90/1.00/1.10 multiplier based on
+                   SPY/QQQ EMA alignment. Disabled by default to keep the
+                   primary_score meta-feature stable across train/inference
+                   (regime info is already exposed via spy_ema_aligned /
+                   qqq_ema_aligned features).
+
     Returns a float Series with the same index as feat_df.
-    Max possible: 135 x 1.10 ~= 148.
+    Max base score: 135. With apply_regime=True ceiling is ~148.
     """
     df = feat_df
 
@@ -133,7 +142,10 @@ def compute_signal_score_col(feat_df: pd.DataFrame) -> pd.Series:
     score += (df['macd_hist_pct'] > 0).astype(float) * 8
     score += (df['macd_line_pct'] > 0).astype(float) * 7
 
-    # Regime multiplier
+    if not apply_regime:
+        return score.round(1)
+
+    # Optional regime multiplier (disabled for primary_score meta-feature)
     spy = df['spy_ema_aligned'].fillna(0) if 'spy_ema_aligned' in df.columns else pd.Series(0.0, index=df.index)
     qqq = df['qqq_ema_aligned'].fillna(0) if 'qqq_ema_aligned' in df.columns else pd.Series(0.0, index=df.index)
     mult = pd.Series(1.0, index=df.index)
@@ -669,5 +681,10 @@ def indicators_to_feature_row(
         'momentum_rank_20d':  float(indicators.get('momentum_rank_20d', 0.5)),
         'vol_ratio_rank':     float(indicators.get('vol_ratio_rank',    0.5)),
         # Primary-signal meta-feature — caller injects via indicators dict.
-        'primary_score':      float(indicators.get('signal_score',     0.0)),
+        # Uses BASE score (pre-regime-multiplier) for train/inference parity:
+        # the training side computes primary_score with apply_regime=False, so
+        # inference must match. The regime info still reaches the model via
+        # the spy_ema_aligned / qqq_ema_aligned features.
+        'primary_score':      float(indicators.get('primary_base_score',
+                                                    indicators.get('signal_score', 0.0))),
     }

@@ -119,20 +119,31 @@ class PortfolioManager:
 
     # ── Stop calculation ───────────────────────────────────────────────────
 
-    def _compute_stop(self, entry_price: float, vwap: float) -> float:
+    def _compute_stop(self, entry_price: float, vwap: float,
+                       d_atr_pct: float = 0.0, atr_mult: float = 1.5) -> float:
         """
-        Structural stop: use VWAP when it is >= STRUCTURAL_STOP_MIN_DISTANCE (1%)
-        below entry. Otherwise fall back to the minimum 1% distance.
-        Always clamps to the HARD_STOP_LOSS_PCT (-3.5%) floor.
-        """
-        hard_floor = entry_price * (1 - HARD_STOP_LOSS_PCT)
-        min_stop   = entry_price * (1 - STRUCTURAL_STOP_MIN_DISTANCE)
+        Stop placement (ATR-aware):
 
-        if vwap > 0 and vwap <= min_stop:
-            # VWAP is at least 1% below entry — use it (respect hard floor)
+          1. Compute three candidate distances:
+               - structural floor: max(STRUCTURAL_STOP_MIN_DISTANCE, atr_mult * d_atr_pct)
+                 (volatility-scaled so high-ATR stocks don't get noise-stopped)
+               - VWAP-based: use VWAP if it's beyond the structural floor
+          2. Use the tighter of (VWAP, structural-floor distance) — but never
+             tighter than structural-floor (avoids noise stops on high-vol names)
+          3. Clamp to HARD_STOP_LOSS_PCT (-3.5%) absolute floor
+
+        For NVDA at 3% daily ATR: stop = 1.5 * 3% = 4.5%, clamped to 3.5%.
+        For V at 1% daily ATR:    stop = 1.5 * 1% = 1.5%, ample headroom.
+        For low ATR or missing data: falls back to STRUCTURAL_STOP_MIN_DISTANCE.
+        """
+        hard_floor    = entry_price * (1 - HARD_STOP_LOSS_PCT)
+        atr_distance  = max(STRUCTURAL_STOP_MIN_DISTANCE, atr_mult * abs(d_atr_pct))
+        atr_stop      = entry_price * (1 - atr_distance)
+
+        # VWAP only used if it sits BELOW the ATR-derived stop (still inside hard floor)
+        if vwap > 0 and vwap <= atr_stop:
             return round(max(vwap, hard_floor), 2)
-        # VWAP too close or unavailable — use minimum structural distance
-        return round(max(min_stop, hard_floor), 2)
+        return round(max(atr_stop, hard_floor), 2)
 
     # ── Main execution entry point ─────────────────────────────────────────
 
@@ -180,7 +191,7 @@ class PortfolioManager:
         # ── Guard: ML confidence gate ──────────────────────────────────────
         if ML_ENABLED:
             try:
-                from ml.predict import predict_success_prob, model_info
+                from ml.predict import predict_success_prob, get_threshold, model_info
                 from ml.features import indicators_to_feature_row
                 if model_info() is None:
                     print('  [ML] No trained model found — ML gate skipped')
@@ -190,18 +201,24 @@ class PortfolioManager:
                     feature_row = indicators_to_feature_row(indicators, bar_df, ts,
                                                             rs_vs_qqq=rs)
                     prob = predict_success_prob(feature_row)
-                    if prob < ML_CONFIDENCE_THRESHOLD:
-                        print(f'  [ML] P(TP)={prob:.1%} < '
-                              f'{ML_CONFIDENCE_THRESHOLD:.0%} threshold — skipping')
+                    thr  = get_threshold()       # bundle-tuned, not static
+                    if prob < thr:
+                        print(f'  [ML] P(TP)={prob:.1%} < {thr:.1%} threshold '
+                              f'(bundle-tuned) — skipping')
                         return False
-                    print(f'  [ML] P(TP)={prob:.1%} — gate passed')
+                    print(f'  [ML] P(TP)={prob:.1%} (threshold {thr:.1%}) — gate passed')
             except Exception as e:
                 print(f'  [ML] Gate error: {e} — proceeding without ML filter')
 
         # ── Position sizing ────────────────────────────────────────────────
         entry_price    = indicators['close']
         vwap           = indicators.get('vwap', 0.0)
-        stop_loss_price = self._compute_stop(entry_price, vwap)
+        # d_atr_pct comes from the daily-timeframe feature set; falls back to
+        # 30-min ATR-as-%-of-close if daily is unavailable
+        d_atr_pct = indicators.get('d_atr_pct', 0.0)
+        if not d_atr_pct and indicators.get('atr', 0) and entry_price:
+            d_atr_pct = float(indicators['atr']) / entry_price
+        stop_loss_price = self._compute_stop(entry_price, vwap, d_atr_pct=d_atr_pct)
         stop_distance  = entry_price - stop_loss_price
 
         if stop_distance <= 0:

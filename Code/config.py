@@ -138,7 +138,7 @@ ML_LABEL_TIMEOUT_DAYS = 5           # trading days to wait for TP resolution
 ML_LABEL_TIMEOUT_BARS = ML_LABEL_TIMEOUT_DAYS * 13  # 65 30-min bars
 ML_CONFIDENCE_THRESHOLD = 0.55      # P(TP_hit) gate: must exceed this to trade
 ML_MIN_PRECISION      = 0.30        # walk-forward CV precision floor; raise RuntimeError if below
-ML_SIGNAL_SCORE_THRESHOLD = 90      # only train on bars that score >= this (aligns training with inference)
+ML_SIGNAL_SCORE_THRESHOLD = 100     # MUST equal SIGNAL_BUY_THRESHOLD so training & inference distributions match exactly
 ML_ENABLED            = True        # set False to bypass ML gate entirely
 
 # ── Triple-Barrier Labeling (Lopez de Prado method) ───────────────────────
