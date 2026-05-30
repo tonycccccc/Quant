@@ -508,6 +508,193 @@ def run_oos_backtest(
     }
 
 
+def run_walk_forward_oos(
+    n_folds: int = 4,
+    test_months: int = 3,
+    starting_equity: float = 10_000.0,
+) -> dict:
+    """
+    Multi-fold out-of-sample backtest.
+
+    Splits the dataset into n_folds rolling test windows. For each fold:
+      1. Train a fresh model on ALL data before the test window
+      2. Backtest rule-only and rule+ML on the test window
+      3. Capture per-fold metrics
+
+    Mean OOS performance across folds is a far more reliable read than a
+    single 18/6 split — a single OOS window can land in a freakishly good
+    or freakishly bad regime by accident.
+
+    Returns dict with per-fold results AND aggregated mean/stdev metrics.
+    """
+    from ml.features import FEATURE_COLS, compute_signal_score_col
+    from ml.train import build_model, _wrap_calibrated, compute_recommended_threshold
+    from config import ML_SIGNAL_SCORE_THRESHOLD
+
+    print(f'\n[walk-forward-oos] Loading features from {ML_FEATURES_PATH}')
+    features = pd.read_parquet(ML_FEATURES_PATH)
+    raw_bars = pd.read_parquet(ML_RAW_BARS_PATH)
+
+    # Filter to labeled + signal-score-passing rows for training
+    labeled = features[features['label'].notna()].copy()
+    labeled['label'] = labeled['label'].astype(int)
+    if 'primary_score' in labeled.columns:
+        signal_scores = labeled['primary_score']
+    else:
+        signal_scores = compute_signal_score_col(labeled)
+    labeled_filtered = labeled[signal_scores >= ML_SIGNAL_SCORE_THRESHOLD].copy()
+
+    t_min = labeled_filtered.index.min()
+    t_max = labeled_filtered.index.max()
+    total_months = (t_max - t_min).days / 30.4
+    print(f'[walk-forward-oos] Total span: {t_min.date()} -> {t_max.date()}  '
+          f'({total_months:.1f} months, {len(labeled_filtered):,} filtered rows)')
+
+    if total_months < n_folds * test_months + 6:
+        raise RuntimeError(
+            f'Not enough history for {n_folds} folds of {test_months} months. '
+            f'Need >= {n_folds * test_months + 6} months, have {total_months:.1f}.'
+        )
+
+    # Test windows roll forward at test_months intervals; the LAST one ends at t_max
+    first_test_start = t_max - pd.DateOffset(months=n_folds * test_months)
+    fold_results = []
+
+    for fold_idx in range(n_folds):
+        test_start = first_test_start + pd.DateOffset(months=fold_idx * test_months)
+        test_end   = test_start       + pd.DateOffset(months=test_months)
+
+        train_df = labeled_filtered[labeled_filtered.index < test_start]
+        if len(train_df) < 2000:
+            print(f'  Fold {fold_idx+1}: skipped (only {len(train_df)} training rows)')
+            continue
+
+        oos_features = features[(features.index >= test_start) & (features.index < test_end)]
+        oos_features = oos_features[oos_features['symbol'].isin(WATCHLIST.keys())]
+
+        print(f'\n[walk-forward-oos] Fold {fold_idx+1}/{n_folds}: '
+              f'train < {test_start.date()}  |  test [{test_start.date()} -> {test_end.date()})')
+        print(f'  Train: {len(train_df):,} rows  |  Test feature window: {len(oos_features):,} rows')
+
+        # Train fresh model
+        tp_rate = float(train_df['label'].mean())
+        base    = build_model(tp_rate=tp_rate)
+        model   = _wrap_calibrated(base, train_df[FEATURE_COLS], train_df['label'].to_numpy())
+        rec_thr, _, _ = compute_recommended_threshold(model, train_df, train_df['label'],
+                                                       target_precision=0.50)
+
+        # Benchmark on this fold's test window
+        qqq_ret = _benchmark_return(raw_bars.loc['QQQ'], test_start, test_end) if 'QQQ' in raw_bars.index.get_level_values(0) else 0.0
+        spy_ret = _benchmark_return(raw_bars.loc['SPY'], test_start, test_end) if 'SPY' in raw_bars.index.get_level_values(0) else 0.0
+
+        def predict_fn(feature_row: dict) -> float:
+            row_df = pd.DataFrame([{c: feature_row.get(c, 0.0) for c in FEATURE_COLS}])
+            return float(model.predict_proba(row_df)[0][1])
+
+        # Run both variants on this fold
+        rule_only = run_variant(oos_features, raw_bars, variant='rule_only',
+                                  starting_equity=starting_equity)
+        rule_only.benchmark_return_qqq = qqq_ret
+        rule_only.benchmark_return_spy = spy_ret
+
+        rule_plus_ml = run_variant(
+            oos_features, raw_bars, variant='rule_plus_ml',
+            ml_predict_fn=predict_fn, ml_threshold=rec_thr,
+            starting_equity=starting_equity,
+        )
+        rule_plus_ml.benchmark_return_qqq = qqq_ret
+        rule_plus_ml.benchmark_return_spy = spy_ret
+
+        print(f'  threshold={rec_thr:.3f}  '
+              f'QQQ={qqq_ret:+.2%}  SPY={spy_ret:+.2%}')
+        print(f'  rule_only    : trades={rule_only.n_trades:3d}  '
+              f'win={rule_only.win_rate:.1%}  ret={rule_only.total_return:+.2%}  '
+              f'vs_qqq={rule_only.total_return - qqq_ret:+.2%}')
+        print(f'  rule_plus_ml : trades={rule_plus_ml.n_trades:3d}  '
+              f'win={rule_plus_ml.win_rate:.1%}  ret={rule_plus_ml.total_return:+.2%}  '
+              f'vs_qqq={rule_plus_ml.total_return - qqq_ret:+.2%}')
+
+        fold_results.append({
+            'fold':          fold_idx + 1,
+            'test_start':    test_start.date(),
+            'test_end':      test_end.date(),
+            'threshold':     rec_thr,
+            'qqq_return':    qqq_ret,
+            'spy_return':    spy_ret,
+            'rule_only':     rule_only,
+            'rule_plus_ml':  rule_plus_ml,
+        })
+
+    # ── Aggregate across folds ────────────────────────────────────────────
+    print(f'\n{"="*72}')
+    print(f'  WALK-FORWARD OOS — AGGREGATE ({len(fold_results)} folds)')
+    print(f'{"="*72}')
+
+    def _agg(variant_key: str) -> dict:
+        rets       = [f[variant_key].total_return for f in fold_results]
+        win_rates  = [f[variant_key].win_rate     for f in fold_results]
+        excess_qqq = [f[variant_key].total_return - f['qqq_return'] for f in fold_results]
+        sharpes    = [f[variant_key].sharpe       for f in fold_results]
+        return {
+            'mean_return':      float(np.mean(rets)),
+            'std_return':       float(np.std(rets, ddof=1)) if len(rets) > 1 else 0.0,
+            'mean_win_rate':    float(np.mean(win_rates)),
+            'mean_excess_qqq':  float(np.mean(excess_qqq)),
+            'win_excess_folds': sum(1 for x in excess_qqq if x > 0),
+            'mean_sharpe':      float(np.mean(sharpes)),
+            'n_folds':          len(fold_results),
+        }
+
+    rule_agg = _agg('rule_only')
+    ml_agg   = _agg('rule_plus_ml')
+    qqq_mean = float(np.mean([f['qqq_return'] for f in fold_results]))
+
+    print(f'\n  Mean QQQ buy-and-hold per fold: {qqq_mean:+.2%}')
+    print(f'\n  Rule-only:')
+    print(f'    Mean return / fold: {rule_agg["mean_return"]:+.2%}  '
+          f'(stdev {rule_agg["std_return"]:.2%})')
+    print(f'    Mean win rate:      {rule_agg["mean_win_rate"]:.1%}')
+    print(f'    Mean vs QQQ:        {rule_agg["mean_excess_qqq"]:+.2%}')
+    print(f'    Folds beat QQQ:     {rule_agg["win_excess_folds"]}/{rule_agg["n_folds"]}')
+    print(f'    Mean Sharpe:        {rule_agg["mean_sharpe"]:.2f}')
+
+    print(f'\n  Rule + ML:')
+    print(f'    Mean return / fold: {ml_agg["mean_return"]:+.2%}  '
+          f'(stdev {ml_agg["std_return"]:.2%})')
+    print(f'    Mean win rate:      {ml_agg["mean_win_rate"]:.1%}')
+    print(f'    Mean vs QQQ:        {ml_agg["mean_excess_qqq"]:+.2%}')
+    print(f'    Folds beat QQQ:     {ml_agg["win_excess_folds"]}/{ml_agg["n_folds"]}')
+    print(f'    Mean Sharpe:        {ml_agg["mean_sharpe"]:.2f}')
+
+    # Save per-fold trades
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = LOGS_DIR / 'backtest_walk_forward_trades.csv'
+    rows = []
+    for f in fold_results:
+        for variant_key in ('rule_only', 'rule_plus_ml'):
+            for t in f[variant_key].trades:
+                rows.append({
+                    'fold':         f['fold'],
+                    'variant':      variant_key,
+                    'symbol':       t.symbol,
+                    'entry_time':   t.entry_time.isoformat(),
+                    'exit_time':    t.exit_time.isoformat(),
+                    'shares':       t.shares,
+                    'pnl':          round(t.pnl, 2),
+                    'pnl_pct':      round(t.pnl_pct, 4),
+                    'exit_reason':  t.exit_reason,
+                })
+    if rows:
+        pd.DataFrame(rows).to_csv(out_path, index=False)
+        print(f'\n[walk-forward-oos] Trade ledger -> {out_path}')
+
+    return {
+        'folds': fold_results,
+        'rule_only_agg':    rule_agg,
+        'rule_plus_ml_agg': ml_agg,
+    }
+
+
 def _print_result(result: BacktestResult) -> None:
     print(f'  Variant:        {result.variant}')
     print(f'  Trades:         {result.n_trades}')

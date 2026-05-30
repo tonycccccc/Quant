@@ -132,7 +132,7 @@ ML_RAW_BARS_PATH      = MODELS_DIR / 'raw_bars.parquet'
 ML_FEATURES_PATH      = MODELS_DIR / 'features.parquet'
 ML_MODEL_PATH         = MODELS_DIR / 'quant_model.pkl'
 
-ML_HISTORY_MONTHS     = 24          # months of 30-min bar history to fetch
+ML_HISTORY_MONTHS     = 36          # months of 30-min bar history to fetch (raised from 24 → more training data, same OOS window)
 ML_LABEL_TP_PCT       = 0.05        # forward label: +5% = TP hit (fixed-barrier fallback only)
 ML_LABEL_TIMEOUT_DAYS = 5           # trading days to wait for TP resolution
 ML_LABEL_TIMEOUT_BARS = ML_LABEL_TIMEOUT_DAYS * 13  # 65 30-min bars

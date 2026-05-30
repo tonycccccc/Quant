@@ -156,6 +156,13 @@ def cmd_oos_backtest(args):
     run_oos_backtest(train_months=args.train_months, starting_equity=args.equity)
 
 
+def cmd_walk_forward_oos(args):
+    """Multi-fold walk-forward OOS — averages over N test windows for robustness."""
+    from ml.backtest import run_walk_forward_oos
+    run_walk_forward_oos(n_folds=args.folds, test_months=args.test_months,
+                          starting_equity=args.equity)
+
+
 def cmd_run(args):
     """
     Full pipeline:
@@ -261,6 +268,15 @@ def build_parser() -> argparse.ArgumentParser:
     poos.add_argument('--equity', type=float, default=10_000.0,
                       help='Starting equity for the simulation (default: $10,000)')
 
+    pwf = sub.add_parser('walk-forward-oos',
+                         help='Multi-fold OOS backtest — most reliable read on real-world performance')
+    pwf.add_argument('--folds', type=int, default=4,
+                     help='Number of rolling OOS folds (default: 4)')
+    pwf.add_argument('--test-months', type=int, default=3, dest='test_months',
+                     help='Months per OOS test window (default: 3)')
+    pwf.add_argument('--equity', type=float, default=10_000.0,
+                     help='Starting equity per fold (default: $10,000)')
+
     return p
 
 
@@ -278,8 +294,9 @@ def main():
         'run':           cmd_run,
         'build-dataset': cmd_build_dataset,
         'train-model':   cmd_train_model,
-        'backtest':      cmd_backtest,
-        'oos-backtest':  cmd_oos_backtest,
+        'backtest':         cmd_backtest,
+        'oos-backtest':     cmd_oos_backtest,
+        'walk-forward-oos': cmd_walk_forward_oos,
     }
 
     handler = dispatch.get(args.command)

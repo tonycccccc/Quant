@@ -499,29 +499,36 @@ TP rate in filtered set: 30.7%
 - No Pattern Day Trader rule (3+ same-day round-trips per week requires >=$25k equity).
 - Concurrent positions: backtest allows up to 11 (one per watchlist stock); live system caps at MAX_POSITIONS=5.
 
-### Out-of-Sample Backtest (added 2026-05-29)
+### Walk-Forward OOS (4 folds, 36-month history) — added 2026-05-29
 
-Train on first 18 months, backtest on last 6 months. Fresh model, no leakage.
+The single 18/6 OOS split is one data point. Multi-fold walk-forward gives a much more reliable read by averaging across multiple test windows.
 
-CLI: `python Code/main.py oos-backtest --train-months 18`
+CLI: `python Code/main.py walk-forward-oos --folds 4 --test-months 3`
 
-| Variant | OOS Trades | Win Rate | Total Return | Sharpe | Max DD | vs QQQ | vs SPY |
-|---|---|---|---|---|---|---|---|
-| Rule-only | 272 | 48.5% | +21.5% | 0.74 | -17.9% | **+0.6%** | +8.9% |
-| Rule + ML (thr 0.330) | 221 | 49.8% | +18.0% | 0.80 | -20.2% | -2.9% | +5.4% |
-| QQQ buy-and-hold | — | — | +20.9% | — | — | baseline | +8.2% |
-| SPY buy-and-hold | — | — | +12.6% | — | — | -8.2% | baseline |
+Each fold trains a fresh model on all data BEFORE that fold's test window. No leakage between folds.
 
-**Honest interpretation:**
-- The in-sample +453% / 58.6% win rate was substantially **overfit**. OOS the ML gate barely moves the win rate (48.5% → 49.8%).
-- Rule-only **just barely beats QQQ** (+0.6%) — marginal but positive. The rule-based strategy is real, if modest.
-- **The ML gate is currently NET-NEGATIVE OOS** (-2.9% vs QQQ vs rule-only's +0.6%). It's removing trades that would have been winners.
-- The 0.50 walk-forward CV precision is directionally honest but doesn't translate to outperformance in returns.
+| Fold | Period | QQQ | Rule-only | vs QQQ | Rule+ML | vs QQQ |
+|---|---|---|---|---|---|---|
+| 1 | May–Aug 2025 | +10.5% | **+22.7%** | +12.2% | +17.1% | +6.6% |
+| 2 | Aug–Nov 2025 | +6.8% | -4.5% | -11.3% | -6.8% | -13.6% |
+| 3 | Nov 2025–Feb 2026 | +1.1% | -4.3% | -5.3% | **+2.9%** | +1.9% |
+| 4 | Feb–May 2026 | +17.6% | +17.4% | -0.2% | +16.7% | -0.9% |
+| **Mean** | | **+9.0%** | **+7.8%** | **-1.2%** | **+7.5%** | **-1.5%** |
+| **Stdev** | | — | 14.3% | — | 11.6% | — |
+
+**Single 18/6 OOS (legacy, 24-month history):** Rule-only +21.5% / +0.6% vs QQQ. That window happened to land on fold 1's bull regime and was unrepresentatively favorable — see fold 1 in the table above.
+
+**Aggregate read on the strategy:**
+1. **Regime-dependent.** Bull markets (fold 1, fold 4): strategy works. Choppy/correction (fold 2): strategy underperforms by 11pp. The regime gate is not aggressive enough about staying out of bad markets.
+2. **Neither variant beats QQQ on average** — rule-only -1.2%, rule+ML -1.5%. Roughly equivalent to buy-and-hold over a full cycle.
+3. **ML lowers variance.** Rule stdev 14.3% vs ML stdev 11.6%. Sharpe 0.50 → 0.68. ML costs you returns in trending bulls but saves you in choppy regimes (fold 3: rule -4.3%, ML +2.9%).
+4. **Folds beating QQQ:** rule-only 1/4, rule+ML 2/4.
 
 **Implications for live deployment:**
-- Rule-only is the safer first ship — it's marginally better than buy-and-hold.
-- The ML gate needs more data and refinement before it earns its place in the pipeline. The alerts log will accumulate real distribution data; monthly retraining should help.
-- Don't expect to beat QQQ by a wide margin — the realistic target is to track QQQ with **lower drawdowns** during corrections (the strategy is regime-gated and shouldn't be fully invested in bear regimes).
+- Realistic expectation: **track QQQ within ~1-2% per quarter with lower variance**, not crush it.
+- Rule+ML wins on Sharpe and on resilience in chop. For most investors, that's the right trade-off vs raw return.
+- The strategy needs better regime detection to avoid the fold-2 drawdown. Current `get_regime_bias` (deterministic SPY/QQQ EMA scoring) gets it right in clear regimes but is slow to flag a developing correction.
+- Don't deploy with the expectation of beating SPY/QQQ by wide margins. Deploy with the expectation of comparable returns, lower drawdowns, and accumulating live data to improve the model.
 
 **Per-fold detail (production threshold 0.55):**
 
