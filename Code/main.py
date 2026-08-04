@@ -163,6 +163,62 @@ def cmd_walk_forward_oos(args):
                           starting_equity=args.equity)
 
 
+def cmd_daily_update(args):
+    """
+    Daily update pipeline (run once per trading day, e.g., 08:00 ET pre-market):
+      1. Fetch incremental bars (only new since last cache) — ~30s
+      2. Rebuild features.parquet with fresh data                — ~5 min
+      3. Refresh macro features (24h cache auto-handled)         — <10s
+      4. Retrain model IF older than --retrain-days               — ~5 min
+
+    Designed for cron / Windows Task Scheduler / AWS EventBridge.
+    Idempotent — safe to run multiple times per day.
+    """
+    from datetime import datetime, timedelta
+    import time
+    t0 = time.time()
+
+    log_stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f'\n{"="*66}')
+    print(f'  DAILY UPDATE — {log_stamp}')
+    print(f'{"="*66}')
+
+    # Step 1: incremental bar fetch
+    print('\n[1/4] Fetching incremental bars...')
+    from ml.collect import fetch_incremental
+    fetch_incremental(lookback_days=args.lookback)
+
+    # Step 2: rebuild features
+    print('\n[2/4] Rebuilding features (30-min + 4H + daily + macro + ranks + labels)...')
+    from ml.features import build_all_features
+    build_all_features(save=True)
+
+    # Step 3: check model age
+    print('\n[3/4] Checking model age...')
+    from config import ML_MODEL_PATH
+    should_retrain = False
+    if not ML_MODEL_PATH.exists():
+        print('  No model found — will retrain')
+        should_retrain = True
+    else:
+        model_age_days = (datetime.now().timestamp() - ML_MODEL_PATH.stat().st_mtime) / 86400
+        print(f'  Model age: {model_age_days:.1f} days (retrain threshold: {args.retrain_days})')
+        if args.force_retrain or model_age_days >= args.retrain_days:
+            should_retrain = True
+
+    # Step 4: optional retrain
+    if should_retrain:
+        print(f'\n[4/4] Retraining model...')
+        from ml.train import run_training_pipeline
+        from config import ML_MIN_PRECISION
+        run_training_pipeline(min_precision=ML_MIN_PRECISION)
+    else:
+        print(f'\n[4/4] Skipping retrain (model still fresh; use --force-retrain to override)')
+
+    elapsed = time.time() - t0
+    print(f'\n[daily-update] Complete in {elapsed:.1f}s at {datetime.now().strftime("%H:%M:%S")}')
+
+
 def cmd_tune_bracket(args):
     """Sweep TP/SL/timeout combos and exit-reason histogram."""
     from ml.tune_bracket import run_tp_sl_grid, analyze_exit_reasons
@@ -289,6 +345,15 @@ def build_parser() -> argparse.ArgumentParser:
     pwf.add_argument('--equity', type=float, default=10_000.0,
                      help='Starting equity per fold (default: $10,000)')
 
+    pdu = sub.add_parser('daily-update',
+                          help='Incremental bar fetch + feature rebuild + optional retrain (schedule this)')
+    pdu.add_argument('--lookback', type=int, default=2,
+                     help='Days of overlap on incremental fetch (default: 2)')
+    pdu.add_argument('--retrain-days', type=int, default=7, dest='retrain_days',
+                     help='Retrain if model is this many days old or older (default: 7)')
+    pdu.add_argument('--force-retrain', action='store_true',
+                     help='Retrain regardless of model age')
+
     ptun = sub.add_parser('tune-bracket',
                           help='Grid-search TP/SL/timeout combos for best risk-adjusted return')
     ptun.add_argument('--quick', action='store_true',
@@ -315,6 +380,7 @@ def main():
         'oos-backtest':     cmd_oos_backtest,
         'walk-forward-oos': cmd_walk_forward_oos,
         'tune-bracket':     cmd_tune_bracket,
+        'daily-update':     cmd_daily_update,
     }
 
     handler = dispatch.get(args.command)
