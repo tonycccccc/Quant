@@ -72,6 +72,13 @@ FEATURE_COLS = [
     # ── Meta-feature: primary (rule-based) signal score ───────────────────
     # Lets the secondary ML model condition on what the primary system says.
     'primary_score',        # rule-based score 0-148 from compute_signal_score_col
+    # ── Macro / options-adjacent (added 2026-05-29) ───────────────────────
+    # Free CBOE indices — VIX term structure + put/call sentiment.
+    # See ml/macro_features.py. All are prior-day daily values (no lookahead).
+    'vix_9d',               # 9-day expected S&P vol (^VIX9D)
+    'vix_3m',               # 3-month expected vol (^VIX3M)
+    'vix_term_ratio',       # vix_9d / vix_3m ; >1 = backwardation (fear), <1 = contango (complacency)
+    'put_call_ratio',       # CBOE equity P/C ratio (^CPCE) — sentiment gauge
 ]
 
 _WARMUP_BARS = 70          # 30-min bars to drop at start (indicator warmup)
@@ -456,6 +463,14 @@ def build_feature_matrix(df: pd.DataFrame,
     if 'primary_score' not in feat.columns:
         feat['primary_score'] = 0.0
 
+    # Macro features — populated in build_all_features via daily CBOE join.
+    # Neutral defaults for per-stock invocations so no KeyError downstream.
+    macro_defaults = {'vix_9d': 20.0, 'vix_3m': 22.0,
+                       'vix_term_ratio': 1.0, 'put_call_ratio': 0.7}
+    for macro_col, default in macro_defaults.items():
+        if macro_col not in feat.columns:
+            feat[macro_col] = default
+
     feat = feat.replace([np.inf, -np.inf], 0)
     return feat
 
@@ -511,6 +526,16 @@ def build_all_features(raw_bars=None, save: bool = True) -> pd.DataFrame:
     # ── Primary-signal meta-feature (rule-based score per row) ──
     print('[features] Computing primary rule-based score as meta-feature...')
     combined['primary_score'] = compute_signal_score_col(combined)
+
+    # ── Macro / options-adjacent features (VIX term + put/call) ──
+    print('[features] Fetching CBOE macro features (VIX term, put/call)...')
+    from ml.macro_features import fetch_macro_features, align_to_intraday
+    macro_start = combined.index.min().tz_convert(None) if combined.index.tz else combined.index.min()
+    macro_end   = combined.index.max().tz_convert(None) if combined.index.tz else combined.index.max()
+    macro_daily = fetch_macro_features(macro_start, macro_end)
+    macro_aligned = align_to_intraday(macro_daily, combined.index)
+    for col in ('vix_9d', 'vix_3m', 'vix_term_ratio', 'put_call_ratio'):
+        combined[col] = macro_aligned[col].values
 
     # Final pass: zero-fill any NaN in FEATURE_COLS (some symbols may have
     # missing ranks if they're the only one trading at a given bar).
@@ -687,4 +712,11 @@ def indicators_to_feature_row(
         # the spy_ema_aligned / qqq_ema_aligned features.
         'primary_score':      float(indicators.get('primary_base_score',
                                                     indicators.get('signal_score', 0.0))),
+        # Macro / options-adjacent features — caller injects via indicators dict.
+        # See phase1_polling: get_latest_macro() from ml.macro_features runs once
+        # per polling cycle and injects these into every ticker's indicators.
+        'vix_9d':             float(indicators.get('vix_9d',         20.0)),
+        'vix_3m':             float(indicators.get('vix_3m',         22.0)),
+        'vix_term_ratio':     float(indicators.get('vix_term_ratio', 1.0)),
+        'put_call_ratio':     float(indicators.get('put_call_ratio', 0.7)),
     }

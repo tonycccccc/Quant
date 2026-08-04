@@ -497,6 +497,51 @@ class TestProductionThreshold:
         assert mp.get_threshold() == ML_CONFIDENCE_THRESHOLD
 
 
+class TestMacroFeatures:
+    def test_macro_features_in_FEATURE_COLS(self):
+        """VIX term + put/call features are in FEATURE_COLS."""
+        expected = ['vix_9d', 'vix_3m', 'vix_term_ratio', 'put_call_ratio']
+        for col in expected:
+            assert col in FEATURE_COLS, f'{col} missing from FEATURE_COLS'
+
+    def test_inference_adapter_fills_macro_defaults(self):
+        """indicators_to_feature_row supplies neutral defaults when macro missing."""
+        indicators = {
+            'close': 100.0, 'ema20': 99.0, 'ema50': 97.0,
+            'atr': 1.5, 'vwap': 99.5, 'volume': 2_000_000,
+            'volume_avg': 1_500_000, 'atr_contraction_ratio': 0.90,
+            'higher_highs': True, 'higher_lows': True,
+            'resistance': 99.0, 'vwap_hold': False,
+            'rsi': 55.0, 'macd_line': 0.0, 'macd_histogram': 0.0,
+        }
+        bar_df = _make_ohlcv(n=100)
+        from datetime import datetime
+        ts = datetime(2025, 3, 5, 10, 0)
+        row = indicators_to_feature_row(indicators, bar_df, ts)
+        assert row['vix_9d']         == 20.0
+        assert row['vix_3m']         == 22.0
+        assert row['vix_term_ratio'] == 1.0
+        assert row['put_call_ratio'] == 0.7
+
+    def test_macro_align_to_intraday(self):
+        """align_to_intraday broadcasts daily values to 30-min bars via shift(1)."""
+        from ml.macro_features import align_to_intraday
+        # Build a 3-day daily macro DF
+        daily_idx = pd.date_range('2024-01-02', periods=3, freq='D')
+        macro = pd.DataFrame({
+            'vix_9d':          [15.0, 20.0, 25.0],
+            'vix_3m':          [18.0, 22.0, 24.0],
+            'vix_term_ratio':  [0.83, 0.91, 1.04],
+            'put_call_ratio':  [0.6,  0.7,  0.9],
+        }, index=daily_idx)
+        # Intraday index: 30-min bars on 2024-01-03 and 2024-01-04
+        intraday_idx = pd.date_range('2024-01-03 09:30', periods=13, freq='30min',
+                                       tz='America/New_York')
+        result = align_to_intraday(macro, intraday_idx)
+        assert len(result) == len(intraday_idx)
+        # Should see 2024-01-02's values (shift(1) means yesterday)
+        assert abs(result['vix_9d'].iloc[0] - 15.0) < 0.01
+
 class TestPrimaryScoreParity:
     def test_default_skips_regime_multiplier(self):
         """compute_signal_score_col returns base score by default (no regime)."""

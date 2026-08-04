@@ -145,14 +145,22 @@ Why ATR-aware:
   - V    at 1% daily ATR -> 1.5 * 1% = 1.5%, ample headroom for normal noise
   - Previous fixed-1% stops were getting noise-stopped on high-vol names
 
-10. Take Profit Logic (SCALING EXIT)
+10. Take Profit Logic (SCALING EXIT — updated 2026-05-30 per grid-search)
 Tiered Exit:
-TP1: +3%
-take 30% position off
-TP2: +7%
-take 50% off
-Runner:
-trail with 10 EMA or VWAP
+TP1: +4%
+take 30% position off (locks in profit early, reduces variance)
+TP2: +10%
+take 70% off
+Timeout: 15 trading days (was 5)
+
+Why the change:
+  A 60-combo TP/SL/timeout grid search on 36 months of data showed
+  the +5%/-3.5%/5-day baseline had Sharpe 0.60 — the worst of any
+  reasonable combination. The winning bracket (+10% TP / -3.5% SL /
+  15-day timeout) more than doubled Sharpe (1.25) with an 8pp lower
+  max drawdown, primarily by giving trades enough time to play out
+  instead of being killed by the 5-day timeout (36% of baseline
+  trades exited at timeout vs 24% at the new setting).
 11. Trailing Stop Logic
 
 Trailing activates only after:

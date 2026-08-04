@@ -163,6 +163,18 @@ def cmd_walk_forward_oos(args):
                           starting_equity=args.equity)
 
 
+def cmd_tune_bracket(args):
+    """Sweep TP/SL/timeout combos and exit-reason histogram."""
+    from ml.tune_bracket import run_tp_sl_grid, analyze_exit_reasons
+    print('\n[tune-bracket] Step 1: exit-reason histogram from existing walk-forward trades')
+    try:
+        analyze_exit_reasons()
+    except FileNotFoundError as e:
+        print(f'  Skipped: {e}')
+    print('\n[tune-bracket] Step 2: TP/SL/timeout grid sweep')
+    run_tp_sl_grid(quick=args.quick)
+
+
 def cmd_run(args):
     """
     Full pipeline:
@@ -277,6 +289,11 @@ def build_parser() -> argparse.ArgumentParser:
     pwf.add_argument('--equity', type=float, default=10_000.0,
                      help='Starting equity per fold (default: $10,000)')
 
+    ptun = sub.add_parser('tune-bracket',
+                          help='Grid-search TP/SL/timeout combos for best risk-adjusted return')
+    ptun.add_argument('--quick', action='store_true',
+                      help='Use a small 3x3x2 grid (faster) instead of 5x4x3')
+
     return p
 
 
@@ -297,6 +314,7 @@ def main():
         'backtest':         cmd_backtest,
         'oos-backtest':     cmd_oos_backtest,
         'walk-forward-oos': cmd_walk_forward_oos,
+        'tune-bracket':     cmd_tune_bracket,
     }
 
     handler = dispatch.get(args.command)

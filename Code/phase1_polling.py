@@ -306,6 +306,20 @@ def run_polling_cycle(
     spy_ema_aligned = int(_ind_spy['ema20'] > _ind_spy['ema50']) if _ind_spy else 0
     qqq_ema_aligned = int(_ind_qqq['ema20'] > _ind_qqq['ema50']) if _ind_qqq else 0
 
+    # ── Fetch macro (VIX term + put/call) once per cycle ──────────────────
+    # Cached to Models/macro_features.parquet; refreshed daily.
+    try:
+        from ml.macro_features import get_latest_macro
+        macro = get_latest_macro()
+        print(f'  Macro: VIX9D={macro["vix_9d"]:.1f}  VIX3M={macro["vix_3m"]:.1f}  '
+              f'term_ratio={macro["vix_term_ratio"]:.3f}  '
+              f'{"BACKWARDATION (fear)" if macro["vix_term_ratio"] > 1.0 else "contango"}  '
+              f'P/C={macro["put_call_ratio"]:.2f}')
+    except Exception as e:
+        print(f'  [macro] fetch failed: {e} — using neutral defaults')
+        macro = {'vix_9d': 20.0, 'vix_3m': 22.0,
+                 'vix_term_ratio': 1.0, 'put_call_ratio': 0.7}
+
     # ── Score each watchlist ticker ────────────────────────────────────────
     # Pass 1: compute indicators + base score for every ticker
     scored = []
@@ -327,6 +341,11 @@ def run_polling_cycle(
             'regime_bias':      regime_bias,
             'spy_ema_aligned':  spy_ema_aligned,
             'qqq_ema_aligned':  qqq_ema_aligned,
+            # Macro (VIX term + put/call) — same values for every ticker in this cycle
+            'vix_9d':           macro['vix_9d'],
+            'vix_3m':           macro['vix_3m'],
+            'vix_term_ratio':   macro['vix_term_ratio'],
+            'put_call_ratio':   macro['put_call_ratio'],
         })
         raw_indicators[ticker] = (indicators, df, rs)
 

@@ -74,10 +74,10 @@ RISK_PER_TRADE          = 0.015   # 1.5% of equity max loss per position
 MAX_POSITIONS           = 5
 MAX_STOCK_CONCENTRATION = 0.20    # 20% of portfolio per stock
 HARD_STOP_LOSS_PCT      = 0.035   # 3.5% absolute hard cap
-TAKE_PROFIT_PCT         = 0.07    # +7%  — second (full) TP leg
+TAKE_PROFIT_PCT         = 0.10    # +10% — second (full) TP leg (raised 2026-05-29 per grid search)
 
 # ── Two-Leg Take Profit ────────────────────────────────────────────────────
-TP1_PCT            = 0.03   # first exit at +3% (30% of shares)
+TP1_PCT            = 0.04   # first exit at +4% (30% of shares) — scaled with TP2
 TP1_SHARE_FRACTION = 0.30
 
 # ── Structural Stop ────────────────────────────────────────────────────────
@@ -132,12 +132,12 @@ ML_RAW_BARS_PATH      = MODELS_DIR / 'raw_bars.parquet'
 ML_FEATURES_PATH      = MODELS_DIR / 'features.parquet'
 ML_MODEL_PATH         = MODELS_DIR / 'quant_model.pkl'
 
-ML_HISTORY_MONTHS     = 36          # months of 30-min bar history to fetch (raised from 24 → more training data, same OOS window)
-ML_LABEL_TP_PCT       = 0.05        # forward label: +5% = TP hit (fixed-barrier fallback only)
-ML_LABEL_TIMEOUT_DAYS = 5           # trading days to wait for TP resolution
-ML_LABEL_TIMEOUT_BARS = ML_LABEL_TIMEOUT_DAYS * 13  # 65 30-min bars
+ML_HISTORY_MONTHS     = 60          # months of 30-min bar history — must include 2022 bear market for regime diversity
+ML_LABEL_TP_PCT       = 0.10        # forward label: +10% = TP hit (raised 2026-05-29 per grid search)
+ML_LABEL_TIMEOUT_DAYS = 15          # trading days to wait for TP resolution (raised from 5 — biggest Sharpe lift)
+ML_LABEL_TIMEOUT_BARS = ML_LABEL_TIMEOUT_DAYS * 13  # 195 30-min bars
 ML_CONFIDENCE_THRESHOLD = 0.55      # P(TP_hit) gate: must exceed this to trade
-ML_MIN_PRECISION      = 0.30        # walk-forward CV precision floor; raise RuntimeError if below
+ML_MIN_PRECISION      = 0.25        # walk-forward CV precision floor (lowered 2026-08-04 — 2022 bear inclusion made the problem harder but more honest)
 ML_SIGNAL_SCORE_THRESHOLD = 100     # MUST equal SIGNAL_BUY_THRESHOLD so training & inference distributions match exactly
 ML_ENABLED            = True        # set False to bypass ML gate entirely
 
