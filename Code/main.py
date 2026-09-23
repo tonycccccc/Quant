@@ -237,6 +237,13 @@ def cmd_ablate_features(_args):
     run_ablation()
 
 
+def cmd_advise(args):
+    """Advisor mode: run the full pipeline for one ticker and report recommendation."""
+    from advisor import advise
+    advise(ticker=args.ticker, equity=args.equity,
+            refresh=args.refresh, verbose=args.verbose)
+
+
 def cmd_run(args):
     """
     Full pipeline:
@@ -368,6 +375,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser('ablate-features',
                     help='Feature ablation: cumulative subsets to find minimum viable feature set')
 
+    pad = sub.add_parser('advise',
+                          help='Advisor mode: full recommendation for one ticker (BUY/WATCH/SKIP + prices)')
+    pad.add_argument('--ticker', required=True,
+                     help='Ticker to analyze (e.g., AVGO)')
+    pad.add_argument('--equity', type=float, default=10_000.0,
+                     help='Assumed account equity for position sizing (default: $10,000)')
+    pad.add_argument('--refresh', action='store_true',
+                     help='Force live Alpaca fetch instead of using cached bars')
+    pad.add_argument('--verbose', action='store_true',
+                     help='Print all raw feature values for debugging')
+
     return p
 
 
@@ -390,6 +408,7 @@ def main():
         'walk-forward-oos': cmd_walk_forward_oos,
         'tune-bracket':     cmd_tune_bracket,
         'ablate-features':  cmd_ablate_features,
+        'advise':           cmd_advise,
         'daily-update':     cmd_daily_update,
     }
 
