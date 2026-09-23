@@ -193,6 +193,14 @@ def cmd_daily_update(args):
     from ml.features import build_all_features
     build_all_features(save=True)
 
+    # Step 2b: refresh fundamentals (yfinance, 24h TTL, non-critical)
+    print('\n[2b/4] Refreshing fundamentals (yfinance)...')
+    try:
+        from ml.fundamentals import refresh_all
+        refresh_all(force=False)
+    except Exception as e:
+        print(f'  [fundamentals] refresh failed: {e} — advisor will use stale/missing data')
+
     # Step 3: check model age
     print('\n[3/4] Checking model age...')
     from config import ML_MODEL_PATH

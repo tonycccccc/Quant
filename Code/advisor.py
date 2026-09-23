@@ -285,6 +285,14 @@ def advise(ticker: str, equity: float = 10_000.0,
         recommendation = f'🚫 BLOCKED — VIX={vix_spot:.1f} >= {VIX_HARD_BLOCK}'
         rec_class = 'BLOCKED'
 
+    # ── 10b. Fundamentals (advisory context — does NOT change trading logic) ──
+    try:
+        from ml.fundamentals import get_ticker as get_fundamentals
+        fund = get_fundamentals(ticker)
+    except Exception as e:
+        print(f'  [advise] fundamentals fetch failed: {e}')
+        fund = {}
+
     result = {
         'ticker':         ticker,
         'as_of':          df.index[-1].isoformat(),
@@ -309,6 +317,7 @@ def advise(ticker: str, equity: float = 10_000.0,
         'exposure':       exposure,
         'risk_dollars':   risk,
         'equity':         equity,
+        'fundamentals':   fund,
     }
     _print_report(result, indicators, bundle_info, verbose=verbose)
     return result
@@ -365,6 +374,57 @@ def _print_report(r: dict, indicators: dict, bundle_info, verbose: bool = False)
                   f'({bundle_info["n_samples"]:,} samples, TP rate {bundle_info["tp_rate"]:.1%})')
     else:
         print(f'    Model disabled/absent — gate skipped')
+
+    # ── Fundamental context (advisory only — does not change trading decisions) ──
+    fund = r.get('fundamentals') or {}
+    if fund.get('fetch_ok'):
+        from ml.fundamentals import quality_label
+        emoji, verdict, desc = quality_label(fund.get('quality_score', float('nan')))
+        print(f'\n  FUNDAMENTAL CONTEXT (yfinance):')
+
+        def _pct(v): return 'N/A' if v is None or pd.isna(v) else f'{v:+.1%}'
+        def _num(v, d=1): return 'N/A' if v is None or pd.isna(v) else f'{v:.{d}f}'
+        def _price(v): return 'N/A' if v is None or pd.isna(v) else f'${v:.2f}'
+        target = fund.get('analyst_target')
+        price  = fund.get('current_price', r.get('price'))
+        upside = (target / price - 1) if target and price and price > 0 else None
+
+        print(f'    Growth:       revenue {_pct(fund.get("revenue_growth"))} YoY, '
+              f'earnings {_pct(fund.get("earnings_growth"))} YoY')
+        print(f'    Valuation:    Forward PE {_num(fund.get("forward_pe"))} '
+              f'| PEG {_num(fund.get("peg_ratio"), 2)} '
+              f'| P/S {_num(fund.get("price_to_sales"), 2)}')
+        print(f'    Profitability: ROE {_pct(fund.get("roe"))} '
+              f'| profit margin {_pct(fund.get("profit_margin"))}')
+        de = fund.get("debt_to_equity")
+        if not pd.isna(de) and de and de > 5: de = de / 100
+        print(f'    Balance:      Debt/Equity {_num(de, 2)} '
+              f'| FCF {"positive" if fund.get("free_cashflow", 0) and fund.get("free_cashflow", 0) > 0 else "n/a"}')
+        rec = fund.get('analyst_rec_mean')
+        rec_label = ('strong buy' if rec and rec < 1.5 else 'buy' if rec and rec < 2.5
+                      else 'hold' if rec and rec < 3.5 else 'sell' if rec else 'N/A')
+        print(f'    Analysts:     {rec_label} (mean {_num(rec, 2)}) '
+              f'| target {_price(target)} '
+              f'({("+" if upside and upside > 0 else "")+f"{upside:.1%}" if upside is not None else "N/A"} upside)')
+        print(f'\n    Quality score: {fund.get("quality_score", 0):.0f}/100  {emoji} {verdict}')
+        print(f'    {desc}')
+
+        # Combined view — cross-reference technical vs fundamental
+        tech_verdict = r["recommendation"]
+        fund_score   = fund.get('quality_score', 50)
+        if tech_verdict == 'BUY' and fund_score >= 70:
+            print(f'\n    COMBINED VIEW: 🟢 HIGH CONVICTION — technical + fundamental both strong')
+        elif tech_verdict == 'BUY' and fund_score < 40:
+            print(f'\n    COMBINED VIEW: 🟠 CAUTION — technical BUY but fundamentals weak. '
+                  f'Consider reduced size or skip.')
+        elif tech_verdict == 'SKIP' and fund_score >= 70:
+            print(f'\n    COMBINED VIEW: 🟡 QUALITY DIP — technical says no BUT fundamentals strong. '
+                  f'Watch for reversal signals; no entry until technical confirms.')
+        elif tech_verdict == 'WATCH' and fund_score >= 70:
+            print(f'\n    COMBINED VIEW: 🟡 PROMISING — WATCH signal + strong fundamentals. '
+                  f'Higher-priority candidate if score climbs above 100.')
+    else:
+        print(f'\n  FUNDAMENTAL CONTEXT: unavailable (yfinance fetch failed for {r["ticker"]})')
 
     # ── Recommendation ────────────────────────────────────────────────────
     print(f'\n  RECOMMENDATION: {"🟢 BUY SIGNAL" if r["recommendation"] == "BUY" else "🟡 WATCH" if r["recommendation"] == "WATCH" else "⚪ SKIP" if r["recommendation"] == "SKIP" else "🚫 BLOCKED"}')
