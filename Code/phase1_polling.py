@@ -37,6 +37,63 @@ except Exception:
 ET = pytz.timezone('America/New_York')
 
 
+# ── Per-stock live feature helpers (BB + Fib + IV rank) ──────────────────
+
+def _compute_live_bb_fib_iv(df: pd.DataFrame) -> dict:
+    """
+    Compute Bollinger, Fibonacci, and IV-rank-proxy features from live bar_df.
+
+    Mirrors the training-time logic in ml/features.build_feature_matrix so
+    inference values match training distribution exactly.
+
+    Returns dict with keys: bb_width, bb_position, fib_distance, fib_in_zone,
+    iv_rank_proxy.  All fall back to neutral defaults on insufficient data.
+    """
+    import numpy as np
+    out = {'bb_width': 0.05, 'bb_position': 0.5,
+           'fib_distance': 0.0, 'fib_in_zone': 0.0,
+           'iv_rank_proxy': 0.5}
+    if df is None or len(df) < 60:
+        return out
+
+    close = df['close']; high = df['high']; low = df['low']
+
+    # Bollinger 20-period
+    bb_ma  = close.rolling(20).mean().iloc[-1]
+    bb_std = close.rolling(20).std().iloc[-1]
+    if pd.notna(bb_ma) and bb_ma > 0 and pd.notna(bb_std):
+        bb_upper = bb_ma + 2 * bb_std
+        bb_lower = bb_ma - 2 * bb_std
+        out['bb_width']    = float((bb_upper - bb_lower) / bb_ma)
+        rng = bb_upper - bb_lower
+        if rng > 0:
+            out['bb_position'] = float(max(-0.5, min(1.5, (close.iloc[-1] - bb_lower) / rng)))
+
+    # Fibonacci — swing high/low over last 60 bars
+    swing_high = high.iloc[-60:].max()
+    swing_low  = low.iloc[-60:].min()
+    swing_range = swing_high - swing_low
+    if swing_range > 0:
+        c = close.iloc[-1]
+        fib_ratios = [0.236, 0.382, 0.500, 0.618, 0.786]
+        levels = [swing_low + r * swing_range for r in fib_ratios]
+        dists = [(c - lvl) / c for lvl in levels]
+        abs_dists = [abs(d) for d in dists]
+        near_idx = abs_dists.index(min(abs_dists))
+        out['fib_distance'] = float(dists[near_idx])
+        out['fib_in_zone']  = float(abs_dists[near_idx] <= 0.01)
+
+    # IV rank proxy: 20-bar realized-vol percentile vs 1yr window
+    if len(close) >= 200:
+        log_rets = np.log(close / close.shift(1))
+        real_vol = log_rets.rolling(20).std().dropna()
+        if len(real_vol) >= 200:
+            current = real_vol.iloc[-1]
+            window  = real_vol.iloc[-min(len(real_vol), 3276):]
+            out['iv_rank_proxy'] = float((current > window).mean())
+    return out
+
+
 # ── Cross-sectional rank helpers ──────────────────────────────────────────
 
 def _compute_live_daily_feature(df: pd.DataFrame, kind: str) -> float:
@@ -336,6 +393,10 @@ def run_polling_cycle(
             continue
 
         rs = ta.compute_rs_vs_qqq(df, qqq_df) if len(qqq_df) >= 10 else 0.0
+
+        # Compute per-stock BB + Fib + IV rank proxy from live bar_df (matches training)
+        indicators.update(_compute_live_bb_fib_iv(df))
+
         indicators.update({
             'rs_vs_qqq':        round(rs, 4),
             'regime_bias':      regime_bias,

@@ -35,12 +35,11 @@ from config import MODELS_DIR
 # Cache path — cleared automatically if older than 24 hours
 MACRO_CACHE_PATH = MODELS_DIR / 'macro_features.parquet'
 
-# yfinance tickers
-_TICKERS = {
+# yfinance tickers (^CPCE 404s on yfinance — put/call fetched via stooq below)
+_YF_TICKERS = {
     'vix_9d':          '^VIX9D',
     'vix':             '^VIX',       # already fetched elsewhere, useful for spot cross-check
     'vix_3m':          '^VIX3M',
-    'put_call_ratio':  '^CPCE',      # CBOE equity put/call ratio (updated daily)
 }
 
 
@@ -66,6 +65,52 @@ def _fetch_yf_series(ticker: str, start: pd.Timestamp, end: pd.Timestamp) -> pd.
         return pd.Series(dtype=float, name=ticker)
 
 
+def _fetch_put_call_from_stooq(start: pd.Timestamp, end: pd.Timestamp) -> pd.Series:
+    """
+    Fetch CBOE equity put/call ratio from stooq.com (free daily CSV).
+    Fallback chain: stooq direct CSV -> pandas-datareader -> None.
+
+    stooq URL pattern: https://stooq.com/q/d/?s=^cpce&d1=YYYYMMDD&d2=YYYYMMDD&i=d&f=csv
+    Returns tz-naive daily Series indexed by date, name='put_call_ratio'.
+    """
+    import io
+    import requests
+
+    # Try stooq direct CSV — a few alternate URL patterns
+    for ticker_url in ('%5Ecpce', 'cpce.us', '%5Ecpc'):
+        url = (f'https://stooq.com/q/d/l/?s={ticker_url}'
+               f'&d1={start.strftime("%Y%m%d")}'
+               f'&d2={end.strftime("%Y%m%d")}'
+               f'&i=d')
+        try:
+            r = requests.get(url, timeout=15, headers={'User-Agent': 'Mozilla/5.0'})
+            r.raise_for_status()
+            df = pd.read_csv(io.StringIO(r.text))
+            if df.empty or 'Close' not in df.columns:
+                continue
+            s = df.set_index(pd.to_datetime(df['Date']))['Close']
+            s.name = 'put_call_ratio'
+            s.index.name = None
+            print(f'  put_call_ratio  (stooq {ticker_url}): {len(s)} daily observations')
+            return s
+        except Exception:
+            continue
+
+    # Fallback: pandas-datareader
+    try:
+        import pandas_datareader.data as web
+        s = web.DataReader('^CPCE', 'stooq', start, end)['Close']
+        s.name = 'put_call_ratio'
+        s.index = pd.DatetimeIndex(s.index).tz_localize(None) if s.index.tz else s.index
+        print(f'  put_call_ratio  (pdr stooq): {len(s)} daily observations')
+        return s
+    except Exception as e:
+        print(f'  [macro] pandas-datareader put/call failed: {e}')
+
+    print('  [macro] all put/call sources exhausted — will default to 0.7')
+    return pd.Series(dtype=float, name='put_call_ratio')
+
+
 def fetch_macro_features(start: pd.Timestamp, end: pd.Timestamp,
                            force: bool = False) -> pd.DataFrame:
     """
@@ -88,15 +133,23 @@ def fetch_macro_features(start: pd.Timestamp, end: pd.Timestamp,
                       f'(age {age_hours:.1f}h)')
                 return cached.loc[start:end].copy()
 
-    print(f'[macro] Fetching CBOE indices via yfinance for {start.date()} -> {end.date()}...')
+    print(f'[macro] Fetching CBOE indices ({start.date()} -> {end.date()})...')
     parts = {}
-    for key, ticker in _TICKERS.items():
+    # VIX suite from yfinance (works)
+    for key, ticker in _YF_TICKERS.items():
         s = _fetch_yf_series(ticker, start, end)
         if len(s):
             parts[key] = s
             print(f'  {key:15s} ({ticker}): {len(s):4d} daily observations')
         else:
             print(f'  {key:15s} ({ticker}): FAILED — will fill with defaults')
+
+    # Put/call ratio from stooq (yfinance ^CPCE 404s)
+    pc_series = _fetch_put_call_from_stooq(start, end)
+    if len(pc_series):
+        parts['put_call_ratio'] = pc_series
+    else:
+        print(f'  {"put_call_ratio":15s} (stooq ^CPCE): FAILED — will fill with defaults')
 
     if not parts:
         print('[macro] All macro fetches failed — returning empty frame')

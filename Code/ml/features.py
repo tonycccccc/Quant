@@ -79,6 +79,19 @@ FEATURE_COLS = [
     'vix_3m',               # 3-month expected vol (^VIX3M)
     'vix_term_ratio',       # vix_9d / vix_3m ; >1 = backwardation (fear), <1 = contango (complacency)
     'put_call_ratio',       # CBOE equity P/C ratio (^CPCE) — sentiment gauge
+    # ── Bollinger bands (added 2026-08-04) ────────────────────────────────
+    # 20-bar SMA ± 2*stdev. Complements VWAP for mean-reversion signals.
+    'bb_width',             # (upper - lower) / middle — volatility contraction/expansion
+    'bb_position',          # (close - lower) / (upper - lower) — 0=at lower, 1=at upper
+    # ── Fibonacci retracement distances (added 2026-08-04) ────────────────
+    # Distance to nearest Fib level of the last 60-bar swing high-to-low.
+    # Fib levels: 23.6%, 38.2%, 50%, 61.8%, 78.6%.
+    'fib_distance',         # % distance from close to nearest fib level (signed: +=above, -=below)
+    'fib_in_zone',          # 1 if within 1% of any fib level (support/resistance test)
+    # ── Per-stock IV rank (added 2026-08-04) ──────────────────────────────
+    # Realized-volatility-percentile proxy (yfinance IV chain data is stale/thin).
+    # Rank of current 20-bar realized vol vs its 252-day (1yr) distribution.
+    'iv_rank_proxy',        # 0-1 percentile of current realized vol vs 1yr range
 ]
 
 _WARMUP_BARS = 70          # 30-min bars to drop at start (indicator warmup)
@@ -408,6 +421,58 @@ def build_feature_matrix(df: pd.DataFrame,
     # ── Daily features ────────────────────────────────────────────────────
     feat_daily = _compute_daily_features(df)
 
+    # ── Bollinger Bands (20-bar SMA ± 2*stdev) ──────────────────────────
+    bb_period = 20
+    bb_ma    = close.rolling(bb_period).mean()
+    bb_std   = close.rolling(bb_period).std()
+    bb_upper = bb_ma + 2 * bb_std
+    bb_lower = bb_ma - 2 * bb_std
+    # Width: volatility contraction/expansion indicator (normalized by middle)
+    bb_width = (bb_upper - bb_lower) / bb_ma.where(bb_ma > 0, other=close)
+    # Position: 0 at lower band, 1 at upper band (0.5 = middle)
+    bb_range = (bb_upper - bb_lower).where(bb_upper > bb_lower, other=1.0)
+    bb_position = ((close - bb_lower) / bb_range).clip(-0.5, 1.5)
+
+    # ── Fibonacci retracement — nearest-level distance ──────────────────
+    # Compute swing high/low over last 60 bars, then distance to nearest Fib.
+    fib_period = 60
+    swing_high = high.rolling(fib_period).max()
+    swing_low  = low.rolling(fib_period).min()
+    swing_range = (swing_high - swing_low).where(swing_high > swing_low, other=close)
+
+    # Fib levels (from swing low, upward). 0% = swing_low, 100% = swing_high.
+    fib_ratios = [0.236, 0.382, 0.500, 0.618, 0.786]
+    fib_levels = pd.DataFrame({
+        f'fib_{int(r*1000)}': swing_low + r * swing_range
+        for r in fib_ratios
+    }, index=df.index)
+
+    # Vectorized nearest-level computation via numpy — O(n*k) instead of O(n^2)
+    close_arr = close.to_numpy(dtype=float)
+    close_arr_safe = np.where(close_arr > 0, close_arr, 1.0)
+    # fib_arr: shape (n, 5) — level values per row
+    fib_arr  = fib_levels.to_numpy(dtype=float)
+    dists    = (close_arr[:, None] - fib_arr) / close_arr_safe[:, None]
+    abs_dist = np.where(np.isnan(dists), 999.0, np.abs(dists))
+    nearest  = np.argmin(abs_dist, axis=1)
+    fib_distance_arr = np.where(
+        np.isnan(fib_arr[np.arange(len(fib_arr)), nearest]),
+        0.0,
+        dists[np.arange(len(dists)), nearest],
+    )
+    fib_distance = pd.Series(fib_distance_arr, index=df.index).fillna(0.0)
+    fib_in_zone  = pd.Series(
+        (abs_dist.min(axis=1) <= 0.01).astype(float), index=df.index,
+    )
+
+    # ── IV rank proxy: 20-bar realized vol percentile in 1yr window ─────
+    # Realized vol = std of log returns. Percentile via rank(pct=True) on a
+    # rolling 252-day window (~3276 30-min bars). Uses rolling.rank() which
+    # is C-vectorized — MUCH faster than .apply(lambda).
+    log_rets     = np.log(close / close.shift(1))
+    realized_vol = log_rets.rolling(20).std() * np.sqrt(252 * 13)  # annualized
+    iv_rank_proxy = realized_vol.rolling(3276, min_periods=200).rank(pct=True)
+
     # ── Assemble feature DataFrame ────────────────────────────────────────
     feat = pd.DataFrame({
         # 30-min features
@@ -442,6 +507,14 @@ def build_feature_matrix(df: pd.DataFrame,
         'd_atr_pct':           feat_daily['d_atr_pct'],
         'd_vol_ratio':         feat_daily['d_vol_ratio'],
         'd_return_20d':        feat_daily['d_return_20d'],
+        # Bollinger bands (added 2026-08-04)
+        'bb_width':            bb_width,
+        'bb_position':         bb_position,
+        # Fibonacci retracement (added 2026-08-04)
+        'fib_distance':        fib_distance,
+        'fib_in_zone':         fib_in_zone,
+        # IV rank proxy (added 2026-08-04)
+        'iv_rank_proxy':       iv_rank_proxy,
         # metadata (not model inputs)
         'close_raw': close,
         'high_raw':  high,
@@ -719,4 +792,12 @@ def indicators_to_feature_row(
         'vix_3m':             float(indicators.get('vix_3m',         22.0)),
         'vix_term_ratio':     float(indicators.get('vix_term_ratio', 1.0)),
         'put_call_ratio':     float(indicators.get('put_call_ratio', 0.7)),
+        # Bollinger bands — caller injects from live bar_df analysis.
+        'bb_width':           float(indicators.get('bb_width',       0.05)),
+        'bb_position':        float(indicators.get('bb_position',    0.5)),
+        # Fibonacci retracement — caller injects from live bar_df analysis.
+        'fib_distance':       float(indicators.get('fib_distance',   0.0)),
+        'fib_in_zone':        float(indicators.get('fib_in_zone',    0.0)),
+        # IV rank proxy — realized-vol percentile.
+        'iv_rank_proxy':      float(indicators.get('iv_rank_proxy',  0.5)),
     }
