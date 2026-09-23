@@ -231,6 +231,12 @@ def cmd_tune_bracket(args):
     run_tp_sl_grid(quick=args.quick)
 
 
+def cmd_ablate_features(_args):
+    """Feature ablation: find the minimum feature set that captures most performance."""
+    from ml.feature_ablation import run_ablation
+    run_ablation()
+
+
 def cmd_run(args):
     """
     Full pipeline:
@@ -359,6 +365,9 @@ def build_parser() -> argparse.ArgumentParser:
     ptun.add_argument('--quick', action='store_true',
                       help='Use a small 3x3x2 grid (faster) instead of 5x4x3')
 
+    sub.add_parser('ablate-features',
+                    help='Feature ablation: cumulative subsets to find minimum viable feature set')
+
     return p
 
 
@@ -380,6 +389,7 @@ def main():
         'oos-backtest':     cmd_oos_backtest,
         'walk-forward-oos': cmd_walk_forward_oos,
         'tune-bracket':     cmd_tune_bracket,
+        'ablate-features':  cmd_ablate_features,
         'daily-update':     cmd_daily_update,
     }
 
