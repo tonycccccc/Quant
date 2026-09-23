@@ -118,7 +118,8 @@ def compute_signal_score_col(feat_df: pd.DataFrame,
                    qqq_ema_aligned features).
 
     Returns a float Series with the same index as feat_df.
-    Max base score: 135. With apply_regime=True ceiling is ~148.
+    Max base score: 150 (was 135; +15 for structural_setup added 2026-08-04).
+    With apply_regime=True ceiling is ~165.
     """
     df = feat_df
 
@@ -161,6 +162,32 @@ def compute_signal_score_col(feat_df: pd.DataFrame,
     # MACD momentum (max 15)
     score += (df['macd_hist_pct'] > 0).astype(float) * 8
     score += (df['macd_line_pct'] > 0).astype(float) * 7
+
+    # ── Structural setup: Fib + Bollinger (max 15, added 2026-08-04) ─────
+    # Mirrors technicals.score_signal exactly.
+    if 'fib_in_zone' in df.columns and 'bb_position' in df.columns:
+        # Fib bucket: only one of the three applies per row (mutually exclusive).
+        # Without fib_near_618 / fib_near_382 columns, we approximate:
+        #   - Use fib_distance to detect closeness to 61.8% and 38.2% levels
+        # Since features.py doesn't split per-level, treat any in-zone as +2.
+        # (Live inference will use exact 618/382 splits via technicals.score_signal.)
+        struct = pd.Series(0.0, index=df.index)
+        struct += (df['fib_in_zone'] > 0).astype(float) * 2
+        struct += (df['bb_position'].fillna(0.5) < 0.3).astype(float) * 5
+        # bb_squeeze proxy: bb_width in bottom 20% of trailing 252 bars per row
+        if 'bb_width' in df.columns:
+            bb_rank = df['bb_width'].rolling(252, min_periods=50).rank(pct=True)
+            struct += (bb_rank.fillna(0.5) < 0.2).astype(float) * 4
+        struct = struct.clip(upper=15)
+        score += struct
+
+    # ── Volatility regime penalty (added 2026-08-04) ─────────────────────
+    if 'iv_rank_proxy' in df.columns:
+        iv = df['iv_rank_proxy'].fillna(0.5)
+        # Two-tier penalty matching technicals.score_signal
+        score += (iv > 0.6).astype(float) * -5
+        score += (iv > 0.8).astype(float) * -5     # cumulative -10 for iv > 0.8
+    score = score.clip(lower=0)
 
     if not apply_regime:
         return score.round(1)

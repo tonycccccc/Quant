@@ -121,6 +121,56 @@ def compute_indicators(df: pd.DataFrame) -> Optional[dict]:
 
     vol_avg = float(vol_ma.iloc[-1]) if not pd.isna(vol_ma.iloc[-1]) else float(volume.mean())
 
+    # ── Bollinger Bands (20-bar SMA ± 2*stdev) ────────────────────────────
+    # Adds mean-reversion and volatility-squeeze signals to the rule score.
+    bb_ma_series  = close.rolling(20).mean()
+    bb_std_series = close.rolling(20).std()
+    bb_ma  = float(bb_ma_series.iloc[-1])  if not pd.isna(bb_ma_series.iloc[-1])  else float(close.iloc[-1])
+    bb_std = float(bb_std_series.iloc[-1]) if not pd.isna(bb_std_series.iloc[-1]) else 0.0
+    if bb_ma > 0 and bb_std > 0:
+        bb_upper = bb_ma + 2 * bb_std
+        bb_lower = bb_ma - 2 * bb_std
+        bb_width = (bb_upper - bb_lower) / bb_ma
+        bb_position = (float(close.iloc[-1]) - bb_lower) / (bb_upper - bb_lower)
+    else:
+        bb_width, bb_position = 0.05, 0.5
+    # 20-percentile of BB width over last 252 bars: signals squeeze
+    bb_width_series = (bb_ma_series + 2 * bb_std_series - (bb_ma_series - 2 * bb_std_series)) / bb_ma_series.where(bb_ma_series > 0, other=1.0)
+    bb_squeeze = bool(bb_width < bb_width_series.tail(252).quantile(0.20)) \
+        if len(bb_width_series.dropna()) >= 50 else False
+
+    # ── Fibonacci retracement — buy-zone detection ────────────────────────
+    # Compute swing high/low over last 60 bars, then check if we're near a
+    # Fib support level (23.6% / 38.2% / 50% / 61.8% / 78.6% from swing low).
+    fib_period = 60
+    swing_high = float(high.iloc[-fib_period:].max()) if len(high) >= fib_period else float(high.max())
+    swing_low  = float(low.iloc[-fib_period:].min())  if len(low)  >= fib_period else float(low.min())
+    swing_range = swing_high - swing_low
+    fib_levels = {}
+    fib_in_zone = False
+    fib_near_618 = False   # golden ratio — strongest pullback level
+    fib_near_382 = False   # secondary support
+    if swing_range > 0:
+        c_price = float(close.iloc[-1])
+        for ratio, label in [(0.236, '236'), (0.382, '382'), (0.500, '500'),
+                              (0.618, '618'), (0.786, '786')]:
+            level = swing_low + ratio * swing_range
+            fib_levels[f'fib_{label}'] = level
+            dist_pct = abs(c_price - level) / c_price if c_price > 0 else 1.0
+            if dist_pct <= 0.01:
+                fib_in_zone = True
+                if label == '618': fib_near_618 = True
+                if label == '382': fib_near_382 = True
+
+    # ── IV rank proxy: 20-bar realized-vol percentile over last 252 bars ──
+    log_rets = pd.Series(close).pct_change().apply(lambda x: 0 if pd.isna(x) else x)
+    realized_vol = log_rets.rolling(20).std()
+    iv_rank_proxy = 0.5
+    if len(realized_vol.dropna()) >= 200:
+        current = float(realized_vol.iloc[-1])
+        window  = realized_vol.dropna().tail(3276)
+        iv_rank_proxy = float((current > window).mean())
+
     return {
         'close':                float(close.iloc[-1]),
         'high':                 float(high.iloc[-1]),
@@ -139,6 +189,14 @@ def compute_indicators(df: pd.DataFrame) -> Optional[dict]:
         'rsi':                  float(rsi_ser.iloc[-1]),
         'macd_line':            float(macd_out['macd_line'].iloc[-1]),
         'macd_histogram':       float(macd_out['histogram'].iloc[-1]),
+        # ── Structural setup (2026-08-04) ─────────────────────────────────
+        'bb_width':             float(bb_width),
+        'bb_position':          float(bb_position),
+        'bb_squeeze':           bb_squeeze,
+        'fib_in_zone':          fib_in_zone,
+        'fib_near_618':         fib_near_618,   # golden-ratio pullback (highest weight)
+        'fib_near_382':         fib_near_382,   # secondary support
+        'iv_rank_proxy':        iv_rank_proxy,
     }
 
 
@@ -146,15 +204,17 @@ def compute_indicators(df: pd.DataFrame) -> Optional[dict]:
 
 def score_signal(indicators: dict, rs_vs_qqq: float) -> tuple:
     """
-    Score the setup on a 0–135 base scale.
+    Score the setup on a 0–150 base scale.
     Component breakdown:
-      trend_score       max 25   (EMA alignment + HH/HL structure)
-      breakout_strength max 20   (close > resistance)
-      volume_quality    max 20   (volume vs average)
-      vwap_support      max 20   (price above VWAP + hold)
-      relative_strength max 15   (5-day RS vs QQQ)
-      rsi_quality       max 20   (RSI momentum zone; >80 = hard block → 0)
-      macd_momentum     max 15   (histogram > 0 and/or macd_line > 0)
+      trend_score        max 25   (EMA alignment + HH/HL structure)
+      breakout_strength  max 20   (close > resistance)
+      volume_quality     max 20   (volume vs average)
+      vwap_support       max 20   (price above VWAP + hold)
+      relative_strength  max 15   (5-day RS vs QQQ)
+      rsi_quality        max 20   (RSI momentum zone; >80 = hard block → 0)
+      macd_momentum      max 15   (histogram > 0 and/or macd_line > 0)
+      structural_setup   max 15   (Fib support + BB pullback + squeeze)  [added 2026-08-04]
+      vol_regime_penalty ≤  0    (high IV rank → -10 penalty)             [added 2026-08-04]
     Returns (base_score, components_dict).
     base_score is 0 when RSI >= RSI_OVERBOUGHT (overbought hard block).
     """
@@ -215,21 +275,47 @@ def score_signal(indicators: dict, rs_vs_qqq: float) -> tuple:
     if macd_hist > 0:    macd_score += 8   # momentum accelerating (line > signal)
     if macd_line > 0:    macd_score += 7   # overall bullish trend (above zero)
 
-    base_score = trend + breakout + volume_score + vwap_score + rs_score + rsi_score + macd_score
+    # ── Structural setup: Fib + Bollinger (max 15, added 2026-08-04) ──────
+    # Rewards confluence with well-known institutional levels.
+    structural = 0
+    if c.get('fib_near_618', False):    structural += 6   # golden-ratio pullback — strongest fib
+    elif c.get('fib_near_382', False):  structural += 4   # 38.2% secondary support
+    elif c.get('fib_in_zone', False):   structural += 2   # any fib level (50%, 23.6%, 78.6%)
+    bb_pos = c.get('bb_position', 0.5)
+    if bb_pos < 0.3:                     structural += 5   # near lower BB — bullish mean-reversion setup
+    if c.get('bb_squeeze', False):       structural += 4   # volatility contraction — breakout candidate
+    structural = min(structural, 15)     # cap at 15 to preserve overall scale
+
+    # ── Volatility regime penalty (added 2026-08-04) ──────────────────────
+    # High realized-vol regimes (chaotic markets) get a score penalty —
+    # discourages trades during known-risky conditions.
+    iv_rank = c.get('iv_rank_proxy', 0.5)
+    vol_regime_penalty = 0
+    if iv_rank > 0.8:      vol_regime_penalty = -10   # top 20% of realized-vol history
+    elif iv_rank > 0.6:    vol_regime_penalty = -5    # 60-80th percentile
+
+    base_score = (trend + breakout + volume_score + vwap_score + rs_score
+                  + rsi_score + macd_score + structural + vol_regime_penalty)
+    base_score = max(0, base_score)   # never below 0
 
     return base_score, {
-        'trend_score':       trend,
-        'breakout_strength': breakout,
-        'volume_quality':    volume_score,
-        'vwap_support':      vwap_score,
-        'relative_strength': rs_score,
-        'rsi_quality':       rsi_score,
-        'macd_momentum':     macd_score,
-        'base_score':        base_score,
-        'rsi_blocked':       False,
-        'rsi':               round(rsi, 1),
-        'vol_ratio':         round(vol_ratio, 3),
-        'atr_contraction':   round(c['atr_contraction_ratio'], 3),
+        'trend_score':        trend,
+        'breakout_strength':  breakout,
+        'volume_quality':     volume_score,
+        'vwap_support':       vwap_score,
+        'relative_strength':  rs_score,
+        'rsi_quality':        rsi_score,
+        'macd_momentum':      macd_score,
+        'structural_setup':   structural,
+        'vol_regime_penalty': vol_regime_penalty,
+        'base_score':         base_score,
+        'rsi_blocked':        False,
+        'rsi':                round(rsi, 1),
+        'vol_ratio':          round(vol_ratio, 3),
+        'atr_contraction':    round(c['atr_contraction_ratio'], 3),
+        'fib_in_zone':        c.get('fib_in_zone', False),
+        'bb_position':        round(bb_pos, 3),
+        'iv_rank_proxy':      round(iv_rank, 3),
     }
 
 

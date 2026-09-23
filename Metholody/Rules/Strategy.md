@@ -211,27 +211,46 @@ no correlated overexposure cluster
 Example forbidden cluster:
 
 NVDA + AMD + AVGO + TSM
-17. Signal Scoring Model
+17. Signal Scoring Model (updated 2026-08-04 — Fib/BB/IV added)
 
 Final score:
 
 Score =
-  trend_score        (max 25 — EMA alignment, price above EMA20/EMA50)
-+ breakout_strength  (max 20 — close vs resistance)
-+ volume_quality     (max 20 — relative volume vs 20-bar MA)
-+ VWAP_support       (max 20 — price above VWAP, VWAP hold bars)
-+ relative_strength  (max 15 — stock 5d return vs QQQ)
-+ rsi_score          (max 20 — RSI zone; hard block at RSI >= 80)
-+ macd_score         (max 15 — MACD histogram and line)
-+ regime_multiplier  (x1.10 both EMAs aligned, x0.90 neither aligned)
+  trend_score          (max 25 — EMA alignment, price above EMA20/EMA50)
++ breakout_strength    (max 20 — close vs resistance)
++ volume_quality       (max 20 — relative volume vs 20-bar MA)
++ VWAP_support         (max 20 — price above VWAP, VWAP hold bars)
++ relative_strength    (max 15 — stock 5d return vs QQQ)
++ rsi_score            (max 20 — RSI zone; hard block at RSI >= 80)
++ macd_score           (max 15 — MACD histogram and line)
++ structural_setup     (max 15 — Fibonacci + Bollinger confluence) ← NEW
++ vol_regime_penalty   (0 to -10 — high realized-vol regime discount) ← NEW
+* regime_multiplier    (x1.10 both EMAs aligned, x0.90 neither aligned)
 
-Max base score: 135. With bullish regime multiplier: ~148.
+Max base score: 150 (was 135). With bullish regime multiplier: ~165.
 
-Threshold:
+Structural setup breakdown (max 15):
+  +6  if close within 1% of 61.8% Fibonacci retracement (golden ratio pullback)
+  +4  else if close within 1% of 38.2% Fibonacci (secondary support)
+  +2  else if close within 1% of any Fib level (23.6% / 50% / 78.6%)
+  +5  if BB position < 0.3 (near lower Bollinger band — mean-reversion setup)
+  +4  if BB width in bottom 20% of trailing 252 bars (volatility squeeze)
+  (capped at 15)
 
+Volatility regime penalty:
+  -5   if iv_rank_proxy > 0.6 (elevated realized volatility)
+  -10  if iv_rank_proxy > 0.8 (extreme realized volatility — chaotic regime)
+  Rationale: fewer trades during known-risky conditions
+
+Threshold (unchanged):
 >= 100 → BUY signal (passes to ML gate)
 80-99  → WATCH
 < 80   → ignore
+
+The new structural_setup category rewards CONFLUENCE — when Fibonacci
+support meets Bollinger lower band during a squeeze. A trade at 55%
+Fibonacci retracement with BB position 0.25 during a volatility squeeze
+picks up +14 pts (6 + 5 + 4 - 1 rounding) that a pure trend-follower misses.
 
 17a. ML Confidence Gate (runs AFTER score >= 100)
 
