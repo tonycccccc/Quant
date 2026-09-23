@@ -264,6 +264,12 @@ def cmd_analyze_bottom(args):
     analyze_bottom(args.ticker)
 
 
+def cmd_scan_momentum(args):
+    """Run the momentum model across the whole universe. Show BUY candidates."""
+    from scan_momentum import scan_momentum
+    scan_momentum(min_score=args.min_score, only_buys=args.only_buys)
+
+
 def cmd_run(args):
     """
     Full pipeline:
@@ -404,6 +410,13 @@ def build_parser() -> argparse.ArgumentParser:
                           help='Support levels + reversal signals for a stock in a downtrend')
     pab.add_argument('--ticker', required=True, help='Ticker to analyze (e.g., AVGO)')
 
+    psm = sub.add_parser('scan-momentum',
+                          help='Run the momentum model across the whole universe; find BUY setups')
+    psm.add_argument('--min-score', type=float, default=0,
+                     help='Filter to tickers with rule score >= this (default: 0 = all)')
+    psm.add_argument('--only-buys', action='store_true',
+                     help='Show only BUY or BUY-noML verdicts')
+
     pad = sub.add_parser('advise',
                           help='Advisor mode: full recommendation for one ticker (BUY/WATCH/SKIP + prices)')
     pad.add_argument('--ticker', required=True,
@@ -440,6 +453,7 @@ def main():
         'advise':            cmd_advise,
         'scan-fundamentals': cmd_scan_fundamentals,
         'analyze-bottom':    cmd_analyze_bottom,
+        'scan-momentum':     cmd_scan_momentum,
         'daily-update':      cmd_daily_update,
     }
 
