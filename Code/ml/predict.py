@@ -57,7 +57,12 @@ def predict_success_prob(feature_row: dict) -> float:
         import numpy as np
         import pandas as pd
 
-        row = pd.DataFrame([{col: feature_row.get(col, 0.0) for col in FEATURE_COLS}])
+        # Use the bundle's own feature_cols — this is the subset the model
+        # was trained on. Older bundles trained on the full 40-feature set
+        # still work because feature_row provides all 40; newer bundles
+        # trained on the 10-feature Wave D subset get just those.
+        model_features = getattr(bundle, 'feature_cols', FEATURE_COLS)
+        row = pd.DataFrame([{col: feature_row.get(col, 0.0) for col in model_features}])
         row = row.replace([float('inf'), float('-inf')], 0.0).fillna(0.0)
 
         prob = float(bundle.model.predict_proba(row)[0][1])

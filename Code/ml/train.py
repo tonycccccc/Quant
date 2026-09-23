@@ -35,7 +35,12 @@ from config import (
     ML_CALIBRATION_METHOD, ML_CALIBRATION_CV,
     ML_CONFIDENCE_THRESHOLD, ML_SAMPLE_WEIGHTS_ENABLED,
 )
-from ml.features import FEATURE_COLS, compute_signal_score_col
+from ml.features import FEATURE_COLS, ML_TRAINING_FEATURES, compute_signal_score_col
+
+# The ML model trains on ML_TRAINING_FEATURES (10) — the ablation-validated
+# subset. FEATURE_COLS (40) stays for logging/alert/backtest visibility.
+# Alias makes the semantic clear at each usage site.
+_MODEL_FEATURES = ML_TRAINING_FEATURES
 
 
 # ── Model bundle serialised to disk ───────────────────────────────────────
@@ -227,10 +232,10 @@ def walk_forward_cv(
 
         tp_rate = float(y_train.mean())
         base    = build_model(tp_rate=tp_rate)
-        model   = _wrap_calibrated(base, X_train[FEATURE_COLS], y_train.to_numpy(),
+        model   = _wrap_calibrated(base, X_train[_MODEL_FEATURES], y_train.to_numpy(),
                                     sample_weight=w_train)
 
-        y_prob = model.predict_proba(X_test[FEATURE_COLS])[:, 1]
+        y_prob = model.predict_proba(X_test[_MODEL_FEATURES])[:, 1]
 
         # Production threshold metrics
         prod_threshold = ML_CONFIDENCE_THRESHOLD
@@ -296,7 +301,7 @@ def compute_recommended_threshold(
 
     n   = len(X)
     cut = int(n * 0.8)
-    X_holdout = X.iloc[cut:][FEATURE_COLS]
+    X_holdout = X.iloc[cut:][_MODEL_FEATURES]
     y_holdout = y.iloc[cut:].to_numpy()
     if len(X_holdout) < 100:
         return 0.55, 0.5, 'holdout too small — using static 0.55 default'
@@ -337,7 +342,7 @@ def train_final_model(
 
     tp_rate = float(y.mean())
     base    = build_model(tp_rate=tp_rate)
-    model   = _wrap_calibrated(base, X[FEATURE_COLS], y.to_numpy(),
+    model   = _wrap_calibrated(base, X[_MODEL_FEATURES], y.to_numpy(),
                                 sample_weight=sample_weights)
 
     # Pick a production threshold tuned to the actual probability distribution
@@ -351,7 +356,7 @@ def train_final_model(
 
     bundle = ModelBundle(
         model=model,
-        feature_cols=FEATURE_COLS,
+        feature_cols=_MODEL_FEATURES,   # 10-feature Wave D subset (ablation winner)
         trained_at=datetime.now().isoformat(),
         n_samples=len(X),
         tp_rate=round(tp_rate, 4),
@@ -383,7 +388,7 @@ def _print_feature_importance(model) -> None:
     if not hasattr(inner, 'feature_importances_'):
         return
 
-    importance = pd.Series(inner.feature_importances_, index=FEATURE_COLS)
+    importance = pd.Series(inner.feature_importances_, index=_MODEL_FEATURES)
     importance = importance.sort_values(ascending=False)
     print('\n[train] Feature importance (top 10):')
     for feat, score in importance.head(10).items():

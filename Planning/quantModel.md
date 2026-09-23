@@ -683,6 +683,62 @@ if p_success >= ML_CONFIDENCE_THRESHOLD:   # 0.55
 
 If `Models/quant_model.pkl` is absent, `predict_success_prob()` returns **0.5** (neutral) and Phase 1 falls back to rule-based scoring alone — no crash, no silent failure.
 
+### Feature Ablation & Reduction to 10-Feature Wave D (2026-08-04)
+
+Ran a systematic 6-wave cumulative feature ablation ([Code/ml/feature_ablation.py](Code/ml/feature_ablation.py)) to test whether adding features monotonically improves the model. **It does not.**
+
+**Ablation results (walk-forward OOS, 5 folds × 6mo, ranked by Sharpe):**
+
+| Wave | # Feat | Return | vs QQQ | Sharpe | Folds > QQQ |
+|---|---|---|---|---|---|
+| 🥇 **D_iv_rank** | **10** | **+19.44%** | **+7.72%** | **1.04** | 3/5 |
+| 🥈 B_momentum | 6 | +17.33% | +5.62% | 1.03 | 3/5 |
+| 🥉 E_intraday | 15 | +19.05% | +7.34% | 1.02 | 2/5 |
+| 4 | C_vix | 9 | +17.48% | +5.77% | 0.96 | 2/5 |
+| 5 | A_minimal | 3 | +14.80% | +3.08% | 0.94 | 3/5 |
+| **6 (WORST)** | **F_kitchen_sink** | **40** | **+16.18%** | **+4.46%** | **0.92** | 3/5 |
+
+**The 40-feature "kitchen sink" was THE WORST by Sharpe.** Adding features 10 → 40 hurt Sharpe by 12% and lost 3.3pp vs QQQ.
+
+**Root cause:** with only ~50K training rows, 40 features left too many degrees of freedom. LightGBM found spurious patterns that didn't generalize to OOS.
+
+### Adopted: 10-feature Wave D subset (ablation winner)
+
+```python
+ML_TRAINING_FEATURES = [
+    'd_close_ema20_ratio',   # daily trend position
+    'd_atr_pct',             # daily volatility regime
+    'd_return_20d',          # ~1-month momentum
+    'd_rsi',                 # daily overbought/oversold
+    'd_vol_ratio',           # institutional volume
+    'momentum_rank_20d',     # cross-sectional momentum rank
+    'vix_9d',                # short-term expected S&P vol
+    'vix_3m',                # long-term expected S&P vol
+    'vix_term_ratio',        # backwardation/contango
+    'iv_rank_proxy',         # per-stock realized-vol percentile
+]
+```
+
+**FEATURE_COLS (40) still computed for logging/alerts/backtest visibility.** Only `ML_TRAINING_FEATURES` (10) reaches the ML model.
+
+**Post-reduction walk-forward OOS (verified 2026-08-04):**
+
+| Metric | 40-feature | **10-feature** | Δ |
+|---|---|---|---|
+| Rule+ML return | +16.18% | **+19.44%** | **+3.3pp** |
+| Rule+ML vs QQQ | +4.46% | **+7.72%** | **+3.3pp** |
+| Rule+ML Sharpe | 0.92 | **1.04** | **+13%** |
+| Rule-only (unchanged, doesn't use ML) | +11.23% vs QQQ | +11.23% vs QQQ | 0 |
+
+**What we removed (30 features that were either neutral or negative):**
+- All 17 intraday 30-min features (except momentum_rank_20d survives via cross-sectional)
+- All 3 4H proxy features
+- 1 daily feature (d_ema_aligned)
+- 3 cross-sectional ranks (kept only momentum_rank_20d)
+- All 4 recently-added BB/Fib features (bb_width, bb_position, fib_distance, fib_in_zone)
+- put_call_ratio (defaulted to constant anyway)
+- primary_score meta-feature
+
 ### Regime-Diversity Extension + Options Data (2026-05-30)
 
 Post-review changes driven by the walk-forward OOS revelation that the strategy has zero framework for bear markets.

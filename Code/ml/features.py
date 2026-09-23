@@ -29,8 +29,33 @@ from config import (
     WATCHLIST, ML_EXTRA_TRAINING_SYMBOLS,
 )
 
+# ── ML TRAINING SUBSET (ablation-validated winner — 10 features) ─────────
+# The 6-wave ablation (2026-08-04, see Code/ml/feature_ablation.py) showed
+# that training on ALL 40 FEATURE_COLS hurt Sharpe by 12% due to overfitting.
+# This 10-feature subset (Wave D) is the ablation winner:
+#   - Best return (+19.44% / 6mo fold)
+#   - Best vs QQQ (+7.72%)
+#   - Best Sharpe (1.04, up from 0.92 with 40 features)
+#
+# All other features are STILL COMPUTED for logging, alert-log, and backtest
+# analysis — but the ML model never sees them.
+ML_TRAINING_FEATURES = [
+    'd_close_ema20_ratio',   # daily trend position
+    'd_atr_pct',             # daily volatility regime
+    'd_return_20d',          # ~1-month momentum
+    'd_rsi',                 # daily overbought/oversold
+    'd_vol_ratio',           # institutional volume
+    'momentum_rank_20d',     # cross-sectional momentum rank
+    'vix_9d',                # short-term expected S&P vol
+    'vix_3m',                # long-term expected S&P vol
+    'vix_term_ratio',        # backwardation/contango signal
+    'iv_rank_proxy',         # per-stock realized-vol percentile
+]
+
 # ── Canonical feature list ─────────────────────────────────────────────────
-# Must match what indicators_to_feature_row() produces for live inference.
+# Full 40-feature surface — computed for all bars for logging/backtest/alert
+# purposes. Only the ML_TRAINING_FEATURES subset above is actually used by
+# the ML model. Live inference still populates all of these for parity.
 FEATURE_COLS = [
     # ── 30-min timeframe ──────────────────────────────────────────────────
     'close_ema20_ratio',    # (close/EMA20) - 1     : intraday trend distance

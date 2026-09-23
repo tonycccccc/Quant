@@ -395,7 +395,7 @@ def run_oos_backtest(
 
     Returns the same dict shape as run_backtest().
     """
-    from ml.features import FEATURE_COLS, compute_signal_score_col
+    from ml.features import FEATURE_COLS, ML_TRAINING_FEATURES, compute_signal_score_col
     from ml.train import build_model, _wrap_calibrated, compute_recommended_threshold
     from config import ML_SIGNAL_SCORE_THRESHOLD
 
@@ -431,7 +431,7 @@ def run_oos_backtest(
     print(f'[oos-backtest] Training on {len(train_df):,} samples '
           f'(TP rate {tp_rate:.1%})...')
     base = build_model(tp_rate=tp_rate)
-    model = _wrap_calibrated(base, train_df[FEATURE_COLS], train_df['label'].to_numpy())
+    model = _wrap_calibrated(base, train_df[ML_TRAINING_FEATURES], train_df['label'].to_numpy())
 
     # Tune threshold on a holdout slice of training (NOT test) data
     rec_thr, top10_thr, notes = compute_recommended_threshold(
@@ -451,7 +451,7 @@ def run_oos_backtest(
     print(f'[oos-backtest] OOS benchmark — QQQ: {qqq_ret:+.2%}  |  SPY: {spy_ret:+.2%}')
 
     def predict_fn(feature_row: dict) -> float:
-        row_df = pd.DataFrame([{c: feature_row.get(c, 0.0) for c in FEATURE_COLS}])
+        row_df = pd.DataFrame([{c: feature_row.get(c, 0.0) for c in ML_TRAINING_FEATURES}])
         return float(model.predict_proba(row_df)[0][1])
 
     # Rule-only on OOS window
@@ -527,7 +527,7 @@ def run_walk_forward_oos(
 
     Returns dict with per-fold results AND aggregated mean/stdev metrics.
     """
-    from ml.features import FEATURE_COLS, compute_signal_score_col
+    from ml.features import FEATURE_COLS, ML_TRAINING_FEATURES, compute_signal_score_col
     from ml.train import build_model, _wrap_calibrated, compute_recommended_threshold
     from config import ML_SIGNAL_SCORE_THRESHOLD
 
@@ -576,10 +576,10 @@ def run_walk_forward_oos(
               f'train < {test_start.date()}  |  test [{test_start.date()} -> {test_end.date()})')
         print(f'  Train: {len(train_df):,} rows  |  Test feature window: {len(oos_features):,} rows')
 
-        # Train fresh model
+        # Train fresh model — use ablation-winner 10-feature subset
         tp_rate = float(train_df['label'].mean())
         base    = build_model(tp_rate=tp_rate)
-        model   = _wrap_calibrated(base, train_df[FEATURE_COLS], train_df['label'].to_numpy())
+        model   = _wrap_calibrated(base, train_df[ML_TRAINING_FEATURES], train_df['label'].to_numpy())
         rec_thr, _, _ = compute_recommended_threshold(model, train_df, train_df['label'],
                                                        target_precision=0.50)
 
@@ -588,7 +588,7 @@ def run_walk_forward_oos(
         spy_ret = _benchmark_return(raw_bars.loc['SPY'], test_start, test_end) if 'SPY' in raw_bars.index.get_level_values(0) else 0.0
 
         def predict_fn(feature_row: dict) -> float:
-            row_df = pd.DataFrame([{c: feature_row.get(c, 0.0) for c in FEATURE_COLS}])
+            row_df = pd.DataFrame([{c: feature_row.get(c, 0.0) for c in ML_TRAINING_FEATURES}])
             return float(model.predict_proba(row_df)[0][1])
 
         # Run both variants on this fold
