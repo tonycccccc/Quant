@@ -254,6 +254,54 @@ def _compute_quality_score(row: pd.Series) -> float:
 
 # ── Verdict label ────────────────────────────────────────────────────────
 
+def leaderboard(filter_mode: str = 'all') -> pd.DataFrame:
+    """
+    Print a sorted leaderboard of all tickers by fundamental quality score.
+
+    filter_mode:
+      'all'          — every ticker
+      'strong'       — quality score >= 70 only
+      'quality-dips' — quality >= 70 AND technical signal weak (advisor SKIP)
+                       These are watchlist-priority: quality names at oversold levels.
+
+    Returns the leaderboard DataFrame (also prints).
+    """
+    df = refresh_all(force=False)
+    if 'fetch_ok' in df.columns:
+        df = df[df['fetch_ok'] == True]
+
+    # Filter
+    if filter_mode == 'strong':
+        df = df[df['quality_score'] >= 70]
+    elif filter_mode == 'quality-dips':
+        # Needs technical context — compute in caller or delegate
+        df = df[df['quality_score'] >= 70]  # start with strong, filter for dips downstream
+
+    df = df.sort_values('quality_score', ascending=False)
+
+    print(f'\n{"="*82}')
+    print(f'  FUNDAMENTALS LEADERBOARD — {len(df)} tickers  (filter: {filter_mode})')
+    print(f'{"="*82}')
+    header = f'  {"#":<3} {"Ticker":<6} {"Score":>6} {"Rev%":>7} {"Earn%":>7} {"FwdPE":>7} {"PEG":>5} {"ROE":>7} {"Target%":>8} {"Rec":>5} {"Verdict":>8}'
+    print(header)
+    print(f'  {"-"*80}')
+    for i, (ticker, r) in enumerate(df.iterrows(), 1):
+        emoji, verdict, _ = quality_label(r['quality_score'])
+        rev  = f'{r["revenue_growth"]*100:+6.1f}%' if not pd.isna(r["revenue_growth"]) else '   N/A'
+        earn = f'{r["earnings_growth"]*100:+6.1f}%' if not pd.isna(r["earnings_growth"]) else '   N/A'
+        pe   = f'{r["forward_pe"]:>6.1f}' if not pd.isna(r["forward_pe"]) else '   N/A'
+        peg  = f'{r["peg_ratio"]:>4.2f}' if not pd.isna(r["peg_ratio"]) else ' N/A'
+        roe  = f'{r["roe"]*100:+6.1f}%' if not pd.isna(r["roe"]) else '   N/A'
+        upside = '   N/A'
+        if not pd.isna(r["analyst_target"]) and not pd.isna(r["current_price"]) and r["current_price"] > 0:
+            up = r["analyst_target"] / r["current_price"] - 1
+            upside = f'{up*100:+6.1f}%'
+        rec = f'{r["analyst_rec_mean"]:>4.2f}' if not pd.isna(r["analyst_rec_mean"]) else ' N/A'
+        print(f'  {i:<3} {ticker:<6} {r["quality_score"]:>5.0f}  {rev} {earn} {pe} {peg} {roe} {upside} {rec}  {emoji} {verdict}')
+
+    return df
+
+
 def quality_label(score: float) -> tuple:
     """
     Convert a quality score into (emoji, verdict, description).

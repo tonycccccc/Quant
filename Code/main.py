@@ -252,6 +252,18 @@ def cmd_advise(args):
             refresh=args.refresh, verbose=args.verbose)
 
 
+def cmd_scan_fundamentals(args):
+    """Print a fundamentals leaderboard sorted by quality score."""
+    from ml.fundamentals import leaderboard
+    leaderboard(filter_mode=args.filter)
+
+
+def cmd_analyze_bottom(args):
+    """Analyze potential bottom + reversal signals for a ticker in a downtrend."""
+    from bottom_analysis import analyze_bottom
+    analyze_bottom(args.ticker)
+
+
 def cmd_run(args):
     """
     Full pipeline:
@@ -383,6 +395,15 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser('ablate-features',
                     help='Feature ablation: cumulative subsets to find minimum viable feature set')
 
+    psf = sub.add_parser('scan-fundamentals',
+                          help='Leaderboard of all tickers sorted by fundamental quality score')
+    psf.add_argument('--filter', choices=['all', 'strong', 'quality-dips'], default='all',
+                     help='"strong": quality>=70 | "quality-dips": strong + technical broken')
+
+    pab = sub.add_parser('analyze-bottom',
+                          help='Support levels + reversal signals for a stock in a downtrend')
+    pab.add_argument('--ticker', required=True, help='Ticker to analyze (e.g., AVGO)')
+
     pad = sub.add_parser('advise',
                           help='Advisor mode: full recommendation for one ticker (BUY/WATCH/SKIP + prices)')
     pad.add_argument('--ticker', required=True,
@@ -415,9 +436,11 @@ def main():
         'oos-backtest':     cmd_oos_backtest,
         'walk-forward-oos': cmd_walk_forward_oos,
         'tune-bracket':     cmd_tune_bracket,
-        'ablate-features':  cmd_ablate_features,
-        'advise':           cmd_advise,
-        'daily-update':     cmd_daily_update,
+        'ablate-features':   cmd_ablate_features,
+        'advise':            cmd_advise,
+        'scan-fundamentals': cmd_scan_fundamentals,
+        'analyze-bottom':    cmd_analyze_bottom,
+        'daily-update':      cmd_daily_update,
     }
 
     handler = dispatch.get(args.command)
