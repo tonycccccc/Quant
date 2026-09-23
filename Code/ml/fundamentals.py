@@ -89,6 +89,7 @@ def _fetch_one_ticker(ticker: str) -> dict:
         'earnings_growth':    _get('earningsGrowth'),
         # Profitability
         'profit_margin':      _get('profitMargins'),
+        'operating_margin':   _get('operatingMargins'),
         'roe':                _get('returnOnEquity'),
         'roa':                _get('returnOnAssets'),
         # Balance sheet
@@ -172,62 +173,82 @@ def _compute_quality_score(row: pd.Series) -> float:
     """
     Aggregate fundamentals into a 0-100 quality score.
 
-    Breakdown (max points):
-      Growth        20   (revenue + earnings YoY)
-      Valuation     20   (forward PE + PEG)
-      Profitability 20   (ROE + profit margin)
-      Balance       15   (debt/equity + FCF)
-      Analyst       25   (recommendation + target upside)
+    Emphasizes HARD FINANCIALS reported in earnings filings; de-weights
+    analyst opinions (targets are unreliable and often lagging).
 
-    Missing values contribute 0 to their category (not penalized) so
-    stocks with sparse yfinance data aren't unfairly zeroed.
+    Breakdown (max points):
+      Growth        25   (revenue + earnings YoY, from reported 10-Q/10-K)
+      Valuation     25   (forward PE + PEG + P/S — mathematical, based on filings)
+      Profitability 25   (ROE + profit margin + operating margin — reported)
+      Balance sheet 15   (debt/equity + FCF — reported)
+      Analyst rec   10   (buy/hold/sell only — NO target price)
+
+    Extension penalty: if analyst target ≤ current price (analysts see no
+    upside), score is capped at 65 (DECENT tier) regardless of underlying
+    strength — the market has already priced in the fundamentals.
+
+    Missing values contribute 0 to their category (not penalized).
     """
     if not row.get('fetch_ok', True):
         return np.nan
 
     score = 0.0
 
-    # ── Growth (20 pts) ──────────────────────────────────────────────────
+    # ── Growth (25 pts, from reported filings) ────────────────────────────
     rev_growth = row.get('revenue_growth', np.nan)
     if not pd.isna(rev_growth):
-        if   rev_growth > 0.30: score += 12
-        elif rev_growth > 0.15: score += 8
-        elif rev_growth > 0.05: score += 4
+        if   rev_growth > 0.30: score += 15    # top-tier growth
+        elif rev_growth > 0.15: score += 10
+        elif rev_growth > 0.05: score += 5
     earn_growth = row.get('earnings_growth', np.nan)
     if not pd.isna(earn_growth):
-        if   earn_growth > 0.20: score += 8
+        if   earn_growth > 0.20: score += 10
         elif earn_growth > 0.05: score += 5
 
-    # ── Valuation (20 pts) ───────────────────────────────────────────────
+    # ── Valuation (25 pts, mathematical from reported earnings) ───────────
     fwd_pe = row.get('forward_pe', np.nan)
     if not pd.isna(fwd_pe) and fwd_pe > 0:
-        if   fwd_pe < 15: score += 15
-        elif fwd_pe < 25: score += 10
-        elif fwd_pe < 40: score += 5
+        if   fwd_pe < 15: score += 12
+        elif fwd_pe < 25: score += 8
+        elif fwd_pe < 40: score += 4
+    trailing_pe = row.get('trailing_pe', np.nan)
+    if not pd.isna(trailing_pe) and trailing_pe > 0:
+        # Trailing PE cross-check — punish if wildly higher than forward
+        # (indicates earnings deteriorating fast)
+        if not pd.isna(fwd_pe) and trailing_pe > fwd_pe * 2.5:
+            score -= 3
     peg = row.get('peg_ratio', np.nan)
     if not pd.isna(peg) and peg > 0:
-        if   peg < 1:  score += 5    # cheap for growth
-        elif peg > 3:  score -= 5    # expensive for growth
-    # Clip valuation contribution to [0, 20]
-    score = max(0, score)
+        if   peg < 1:  score += 8       # cheap for growth
+        elif peg < 2:  score += 3
+        elif peg > 3:  score -= 3       # expensive for growth
+    ps = row.get('price_to_sales', np.nan)
+    if not pd.isna(ps) and ps > 0 and ps < 5:
+        score += 5   # reasonable P/S ratio bonus
+    score = max(0, score)   # never negative from valuation alone
 
-    # ── Profitability (20 pts) ───────────────────────────────────────────
+    # ── Profitability (25 pts, from reported financials) ─────────────────
     roe = row.get('roe', np.nan)
     if not pd.isna(roe):
-        if   roe > 0.25: score += 10
-        elif roe > 0.15: score += 7
-        elif roe > 0.08: score += 3
+        if   roe > 0.30: score += 12   # exceptional (NVDA, TSM territory)
+        elif roe > 0.20: score += 9
+        elif roe > 0.12: score += 5
+        elif roe > 0.05: score += 2
     pm = row.get('profit_margin', np.nan)
     if not pd.isna(pm):
-        if   pm > 0.25: score += 10
-        elif pm > 0.15: score += 7
-        elif pm > 0.05: score += 3
+        if   pm > 0.25: score += 8
+        elif pm > 0.15: score += 5
+        elif pm > 0.05: score += 2
+    # Operating margin (if available in row — extend to fetch later)
+    om = row.get('operating_margin', np.nan)
+    if not pd.isna(om):
+        if om > 0.20: score += 5
+        elif om > 0.10: score += 2
 
     # ── Balance sheet (15 pts) ───────────────────────────────────────────
     de = row.get('debt_to_equity', np.nan)
-    # yfinance often reports D/E as a percentage (e.g., 85 for 85%) — normalize
     if not pd.isna(de):
-        if de > 5: de = de / 100   # heuristic: any value > 5 is likely percentage
+        if de > 5: de = de / 100   # yfinance sometimes reports as percent
         if   de < 0.5: score += 10
         elif de < 1.0: score += 7
         elif de < 2.0: score += 3
@@ -235,21 +256,31 @@ def _compute_quality_score(row: pd.Series) -> float:
     if not pd.isna(fcf) and fcf > 0:
         score += 5
 
-    # ── Analyst sentiment (25 pts) ───────────────────────────────────────
+    # ── Analyst recommendation only (10 pts — target price ignored) ──────
+    # Analyst rec is a consensus of many analysts, generally more reliable
+    # than any single target price. We take the buy/hold/sell signal but
+    # NOT the target upside (targets are often revised after the move).
     rec = row.get('analyst_rec_mean', np.nan)
     if not pd.isna(rec):
-        if   rec < 1.5: score += 15
-        elif rec < 2.0: score += 10
-        elif rec < 2.5: score += 5
+        if   rec < 1.5: score += 10      # strong buy consensus
+        elif rec < 2.0: score += 7       # buy
+        elif rec < 2.5: score += 3       # hold-buy
+
+    raw_score = min(100, max(0, round(score, 1)))
+
+    # ── Extension penalty ────────────────────────────────────────────────
+    # If analyst target ≤ current price, cap score. The market has already
+    # priced in the fundamentals — no more room for the story to expand.
+    # Uses analyst target here NOT for scoring (that we removed), but as a
+    # binary signal: "is this stock at/beyond consensus fair value?"
     target = row.get('analyst_target', np.nan)
     price  = row.get('current_price', np.nan)
     if not pd.isna(target) and not pd.isna(price) and price > 0:
         upside = target / price - 1
-        if   upside > 0.20: score += 10
-        elif upside > 0.10: score += 5
-        elif upside > 0.00: score += 2
+        if   upside <= 0.00: raw_score = min(raw_score, 65)   # capped at DECENT
+        elif upside <= 0.05: raw_score = min(raw_score, 72)   # low STRONG only
 
-    return min(100, max(0, round(score, 1)))
+    return raw_score
 
 
 # ── Verdict label ────────────────────────────────────────────────────────
