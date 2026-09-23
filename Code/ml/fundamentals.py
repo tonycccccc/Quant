@@ -169,6 +169,64 @@ def get_ticker(ticker: str, force_refresh: bool = False) -> dict:
 
 # ── Quality score computation ────────────────────────────────────────────
 
+def compute_fair_value(row: pd.Series) -> dict:
+    """
+    Compute a growth-adjusted fair value estimate from reported fundamentals.
+
+    Method (independent of analyst targets):
+      forward_eps         = current_price / forward_pe
+      sustainable_growth  = weighted avg of revenue + earnings growth
+                            (revenue weighted higher — more sustainable)
+      fair_pe             = growth-tier lookup (5-tier ladder)
+      fair_value          = forward_eps * fair_pe
+      discount_to_fair    = (fair_value - price) / price
+
+    Returns dict with all computed values, or None if insufficient data.
+    """
+    fwd_pe = row.get('forward_pe', np.nan)
+    price  = row.get('current_price', np.nan)
+    if pd.isna(fwd_pe) or fwd_pe <= 0 or pd.isna(price) or price <= 0:
+        return {}
+
+    forward_eps = price / fwd_pe
+
+    # Sustainable growth: revenue is more reliable than earnings (which can spike
+    # from one-time gains, tax effects, or coming off a low base). Weight
+    # revenue at 60%, earnings at 40%. Cap at 40% overall — no company
+    # sustains growth above that long enough for a multi-year fair-value.
+    rev_g  = row.get('revenue_growth', np.nan)
+    earn_g = row.get('earnings_growth', np.nan)
+    _CAP = 0.40   # long-term sustainable growth ceiling
+    if not pd.isna(rev_g) and not pd.isna(earn_g):
+        # Cap earnings at 2x revenue (still generous)
+        earn_g_capped = min(earn_g, 2 * abs(rev_g) if rev_g > 0 else 0.30)
+        sustainable_growth = 0.6 * min(rev_g, _CAP) + 0.4 * min(earn_g_capped, _CAP)
+    elif not pd.isna(rev_g):
+        sustainable_growth = min(rev_g, _CAP)
+    elif not pd.isna(earn_g):
+        sustainable_growth = min(earn_g, _CAP)
+    else:
+        return {}
+
+    # Fair PE ladder based on sustainable growth tier
+    if   sustainable_growth > 0.30: fair_pe = 35    # hyper-growth premium
+    elif sustainable_growth > 0.15: fair_pe = 25    # strong growth
+    elif sustainable_growth > 0.05: fair_pe = 18    # mature
+    elif sustainable_growth > 0:    fair_pe = 12    # slow
+    else:                            fair_pe = 8    # declining
+
+    fair_value = forward_eps * fair_pe
+    discount_to_fair = (fair_value - price) / price   # positive = undervalued
+
+    return {
+        'forward_eps':        forward_eps,
+        'sustainable_growth': sustainable_growth,
+        'fair_pe':            fair_pe,
+        'fair_value':         fair_value,
+        'discount_to_fair':   discount_to_fair,
+    }
+
+
 def _compute_quality_score(row: pd.Series) -> float:
     """
     Aggregate fundamentals into a 0-100 quality score.
@@ -268,19 +326,32 @@ def _compute_quality_score(row: pd.Series) -> float:
 
     raw_score = min(100, max(0, round(score, 1)))
 
-    # ── Extension penalty ────────────────────────────────────────────────
-    # If analyst target ≤ current price, cap score. The market has already
-    # priced in the fundamentals — no more room for the story to expand.
-    # Uses analyst target here NOT for scoring (that we removed), but as a
-    # binary signal: "is this stock at/beyond consensus fair value?"
+    # ── Fair-value check (independent of analysts, derived from growth) ──
+    # Compute what the stock SHOULD be worth given its growth rate, and
+    # compare to current price. This is a stronger signal than analyst
+    # target because it's derived directly from reported financials.
+    fv = compute_fair_value(row)
+    if fv:
+        discount = fv['discount_to_fair']    # positive = undervalued
+        if   discount > 0.20:  raw_score += 5    # deeply undervalued (>20% discount)
+        elif discount > 0.05:  raw_score += 3    # undervalued (5-20% discount)
+        elif discount < -0.30: raw_score -= 10   # deeply overvalued
+        elif discount < -0.15: raw_score -= 5    # overvalued
+        # Hard cap when significantly overvalued
+        if discount < -0.20: raw_score = min(raw_score, 60)  # DECENT max
+        if discount < -0.35: raw_score = min(raw_score, 40)  # WEAK max
+
+    # ── Analyst-target cross-check (secondary signal) ────────────────────
+    # Use analyst target ONLY as a sanity check on the fair-value calc.
     target = row.get('analyst_target', np.nan)
     price  = row.get('current_price', np.nan)
     if not pd.isna(target) and not pd.isna(price) and price > 0:
         upside = target / price - 1
-        if   upside <= 0.00: raw_score = min(raw_score, 65)   # capped at DECENT
-        elif upside <= 0.05: raw_score = min(raw_score, 72)   # low STRONG only
+        # Only apply extension cap if BOTH signals agree it's overvalued
+        if upside <= 0.00 and fv and fv.get('discount_to_fair', 0) < 0:
+            raw_score = min(raw_score, 65)   # capped at DECENT
 
-    return raw_score
+    return min(100, max(0, round(raw_score, 1)))
 
 
 # ── Verdict label ────────────────────────────────────────────────────────
@@ -310,25 +381,27 @@ def leaderboard(filter_mode: str = 'all') -> pd.DataFrame:
 
     df = df.sort_values('quality_score', ascending=False)
 
-    print(f'\n{"="*82}')
+    print(f'\n{"="*94}')
     print(f'  FUNDAMENTALS LEADERBOARD — {len(df)} tickers  (filter: {filter_mode})')
-    print(f'{"="*82}')
-    header = f'  {"#":<3} {"Ticker":<6} {"Score":>6} {"Rev%":>7} {"Earn%":>7} {"FwdPE":>7} {"PEG":>5} {"ROE":>7} {"Target%":>8} {"Rec":>5} {"Verdict":>8}'
+    print(f'{"="*94}')
+    header = (f'  {"#":<3} {"Ticker":<6} {"Score":>5} {"Rev%":>7} {"Earn%":>7} '
+              f'{"FwdPE":>6} {"PEG":>5} {"ROE":>7} {"FairVal":>8} {"vs Fair":>8} {"Rec":>5} {"Verdict":>9}')
     print(header)
-    print(f'  {"-"*80}')
+    print(f'  {"-"*92}')
     for i, (ticker, r) in enumerate(df.iterrows(), 1):
         emoji, verdict, _ = quality_label(r['quality_score'])
         rev  = f'{r["revenue_growth"]*100:+6.1f}%' if not pd.isna(r["revenue_growth"]) else '   N/A'
         earn = f'{r["earnings_growth"]*100:+6.1f}%' if not pd.isna(r["earnings_growth"]) else '   N/A'
-        pe   = f'{r["forward_pe"]:>6.1f}' if not pd.isna(r["forward_pe"]) else '   N/A'
+        pe   = f'{r["forward_pe"]:>5.1f}' if not pd.isna(r["forward_pe"]) else '  N/A'
         peg  = f'{r["peg_ratio"]:>4.2f}' if not pd.isna(r["peg_ratio"]) else ' N/A'
         roe  = f'{r["roe"]*100:+6.1f}%' if not pd.isna(r["roe"]) else '   N/A'
-        upside = '   N/A'
-        if not pd.isna(r["analyst_target"]) and not pd.isna(r["current_price"]) and r["current_price"] > 0:
-            up = r["analyst_target"] / r["current_price"] - 1
-            upside = f'{up*100:+6.1f}%'
-        rec = f'{r["analyst_rec_mean"]:>4.2f}' if not pd.isna(r["analyst_rec_mean"]) else ' N/A'
-        print(f'  {i:<3} {ticker:<6} {r["quality_score"]:>5.0f}  {rev} {earn} {pe} {peg} {roe} {upside} {rec}  {emoji} {verdict}')
+        rec  = f'{r["analyst_rec_mean"]:>4.2f}' if not pd.isna(r["analyst_rec_mean"]) else ' N/A'
+        # Fair value from growth-adjusted computation
+        fv = compute_fair_value(r)
+        fair_val_str = f'${fv["fair_value"]:>6.0f}' if fv else '     N/A'
+        vs_fair_str  = f'{fv["discount_to_fair"]*100:+6.1f}%' if fv else '     N/A'
+        print(f'  {i:<3} {ticker:<6} {r["quality_score"]:>4.0f}  {rev} {earn} '
+              f'{pe} {peg} {roe} {fair_val_str} {vs_fair_str}  {rec}  {emoji} {verdict}')
 
     return df
 

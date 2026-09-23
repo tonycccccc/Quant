@@ -406,6 +406,31 @@ def _print_report(r: dict, indicators: dict, bundle_info, verbose: bool = False)
         print(f'    Analysts:     {rec_label} (mean {_num(rec, 2)}) '
               f'| target {_price(target)} '
               f'({("+" if upside and upside > 0 else "")+f"{upside:.1%}" if upside is not None else "N/A"} upside)')
+        # Fair value estimate (growth-adjusted, independent of analyst targets)
+        try:
+            from ml.fundamentals import compute_fair_value
+            fv = compute_fair_value(pd.Series(fund))
+            if fv:
+                print(f'\n    FAIR VALUE ESTIMATE (growth-adjusted):')
+                print(f'      Forward EPS:       ${fv["forward_eps"]:.2f}  (price / forward_PE)')
+                print(f'      Sustainable growth: {fv["sustainable_growth"]*100:+.1f}%  (60% rev + 40% earn)')
+                tier = ('hyper-growth' if fv['sustainable_growth'] > 0.30
+                          else 'strong growth' if fv['sustainable_growth'] > 0.15
+                          else 'mature' if fv['sustainable_growth'] > 0.05
+                          else 'slow' if fv['sustainable_growth'] > 0
+                          else 'declining')
+                print(f'      Fair PE for tier:   {fv["fair_pe"]}x  ({tier})')
+                print(f'      Fair value:         ${fv["fair_value"]:.2f}')
+                disc = fv["discount_to_fair"]
+                verdict_price = ('🟢 UNDERVALUED' if disc > 0.10
+                                  else '🟡 fair' if disc > -0.10
+                                  else '🟠 overvalued' if disc > -0.25
+                                  else '🔴 EXPENSIVE')
+                print(f'      vs current ${fund.get("current_price", 0):.2f}: '
+                      f'{disc*100:+.1f}%  {verdict_price}')
+        except Exception:
+            pass
+
         print(f'\n    Quality score: {fund.get("quality_score", 0):.0f}/100  {emoji} {verdict}')
         print(f'    {desc}')
 
