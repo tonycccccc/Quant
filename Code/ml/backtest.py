@@ -150,7 +150,8 @@ def _simulate_trade(
 
     Sizing uses RISK_PER_TRADE / equity / stop_distance. Bracket exits at
     TP / SL / timeout. The first barrier touched within timeout_bars decides
-    the trade.
+    the trade. If both barriers are touched in the same bar, assume the
+    stop-loss is hit first: OHLC bars cannot establish intrabar ordering.
     """
     entry_price = float(bars['close'].iloc[entry_idx])
     tp_lvl      = entry_price * (1 + tp_pct)
@@ -169,7 +170,7 @@ def _simulate_trade(
         exit_idx    = entry_idx + 1 + tp_first
         exit_price  = tp_lvl
         exit_reason = 'tp'
-    elif sl_first < tp_first:
+    elif len(sl_hits) and sl_first <= tp_first:
         exit_idx    = entry_idx + 1 + sl_first
         exit_price  = sl_lvl
         exit_reason = 'sl'
