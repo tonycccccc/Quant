@@ -3,13 +3,10 @@
 *.env
 .env.*
 
-# Generated data / model artifacts (re-run build-dataset + train-model to recreate)
-Models/raw_bars.parquet
-Models/features.parquet
-Models/quant_model.pkl
-Models/macro_features.parquet
+# Generated data / model artifacts (re-run daily-update to recreate)
+Models/
 
-# Database (contains live trading history)
+# Trade history from the retired live-trading pipeline
 trading.db
 
 # Logs (runtime output, not source)

@@ -10,7 +10,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import pytest
 
 # ── Path setup ────────────────────────────────────────────────────────────
 ROOT = Path(__file__).parent.parent
@@ -432,32 +431,28 @@ class TestNewFeatures:
 class TestATRStop:
     def test_high_vol_stock_gets_wider_stop(self):
         """High daily ATR -> stop further from entry, not noise-tight."""
-        from phase2_execution import PortfolioManager
-        pm = PortfolioManager.__new__(PortfolioManager)
+        from technicals import compute_stop
         # Low-vol stock: d_atr_pct = 0.01 -> stop = 1.5%
-        low_stop = pm._compute_stop(entry_price=100.0, vwap=0, d_atr_pct=0.01)
+        low_stop = compute_stop(entry_price=100.0, vwap=0, d_atr_pct=0.01)
         # High-vol stock: d_atr_pct = 0.04 -> 1.5*4% = 6%, clamped to 3.5%
-        high_stop = pm._compute_stop(entry_price=100.0, vwap=0, d_atr_pct=0.04)
+        high_stop = compute_stop(entry_price=100.0, vwap=0, d_atr_pct=0.04)
         assert high_stop < low_stop, \
             f'High-vol stop ({high_stop}) should be deeper than low-vol stop ({low_stop})'
 
     def test_hard_floor_respected(self):
         """Stop never wider than HARD_STOP_LOSS_PCT regardless of ATR."""
-        from phase2_execution import PortfolioManager
+        from technicals import compute_stop
         from config import HARD_STOP_LOSS_PCT
-        pm = PortfolioManager.__new__(PortfolioManager)
-        # Pathological ATR
-        stop = pm._compute_stop(entry_price=100.0, vwap=0, d_atr_pct=0.20)
+        stop = compute_stop(entry_price=100.0, vwap=0, d_atr_pct=0.20)
         min_allowed = 100.0 * (1 - HARD_STOP_LOSS_PCT)
         assert stop >= min_allowed - 0.01, \
             f'Stop {stop} should not be wider than hard floor {min_allowed}'
 
     def test_vwap_used_when_below_atr_stop(self):
         """When VWAP is below the ATR-derived stop, prefer VWAP."""
-        from phase2_execution import PortfolioManager
-        pm = PortfolioManager.__new__(PortfolioManager)
+        from technicals import compute_stop
         # entry=100, ATR-derived stop = 98.5, VWAP=98.0 (deeper) -> use VWAP
-        stop = pm._compute_stop(entry_price=100.0, vwap=98.0, d_atr_pct=0.01)
+        stop = compute_stop(entry_price=100.0, vwap=98.0, d_atr_pct=0.01)
         assert stop == 98.0
 
 

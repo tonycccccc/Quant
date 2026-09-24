@@ -13,7 +13,7 @@ from config import (
     VOLUME_MA_PERIOD, RESISTANCE_LOOKBACK, VWAP_HOLD_BARS,
     VOLUME_SPIKE_MULTIPLIER, BREAKOUT_VOLUME_MULTIPLIER,
     RSI_PERIOD, MACD_FAST_PERIOD, MACD_SLOW_PERIOD, MACD_SIGNAL_PERIOD,
-    RSI_OVERBOUGHT,
+    RSI_OVERBOUGHT, HARD_STOP_LOSS_PCT, STRUCTURAL_STOP_MIN_DISTANCE,
 )
 
 
@@ -320,7 +320,7 @@ def score_signal(indicators: dict, rs_vs_qqq: float) -> tuple:
 
 
 def apply_regime_multiplier(base_score: float, regime_bias: str, confidence: float) -> float:
-    """Scale base score by 0.90–1.10 depending on LLM regime output."""
+    """Scale base score by 0.90–1.10 depending on SPY/QQQ regime."""
     conf = min(max(confidence, 0.0), 1.0)
     if regime_bias == 'bullish':
         mult = 1.0 + (0.10 * conf)
@@ -349,3 +349,20 @@ def compute_rs_vs_qqq(stock_df: pd.DataFrame, qqq_df: pd.DataFrame,
         return float(closes.iloc[-1] / closes.iloc[0] - 1) if float(closes.iloc[0]) > 0 else 0.0
 
     return _period_return(stock_df) - _period_return(qqq_df)
+
+
+# ── Stop placement ─────────────────────────────────────────────────────────
+
+def compute_stop(entry_price: float, vwap: float,
+                 d_atr_pct: float = 0.0, atr_mult: float = 1.5) -> float:
+    """
+    ATR-scaled stop: max(STRUCTURAL_STOP_MIN_DISTANCE, atr_mult * daily ATR%)
+    below entry, so high-volatility names aren't noise-stopped. VWAP replaces
+    it when VWAP sits deeper. Never wider than HARD_STOP_LOSS_PCT.
+    """
+    hard_floor   = entry_price * (1 - HARD_STOP_LOSS_PCT)
+    atr_distance = max(STRUCTURAL_STOP_MIN_DISTANCE, atr_mult * abs(d_atr_pct))
+    atr_stop     = entry_price * (1 - atr_distance)
+    if vwap > 0 and vwap <= atr_stop:
+        return round(max(vwap, hard_floor), 2)
+    return round(max(atr_stop, hard_floor), 2)

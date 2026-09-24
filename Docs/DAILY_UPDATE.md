@@ -96,7 +96,7 @@ Lambda:
   Runtime: Python 3.11 (custom Docker image with LightGBM + pandas)
   Timeout: 15 min (max for Lambda; use ECS Task if you need more)
   Memory: 3 GB (feature build needs it)
-  Environment vars: ALPACA_API_KEY, ALPACA_SECRET_KEY, Discord_Webhook, OPEN_ROUTER_API_KEY
+  Environment vars: ALPACA_API_KEY, ALPACA_SECRET_KEY
   Storage: EFS mounted at /mnt/models for Models/ persistence across invocations
   Handler: from ml.main_lambda import daily_update_handler
 ```
@@ -144,7 +144,7 @@ If a run fails partway (e.g., during the feature rebuild):
 2. `features.parquet` may be stale if step 2 failed. Just re-run `daily-update` — step 2 always does a full rebuild.
 3. `quant_model.pkl` is only overwritten on successful save at end of training — never partial.
 
-Rollback: `git checkout Models/quant_model.pkl` if you tracked it, or fall back to the alert-log-based comparison to detect and roll back a bad retrain.
+Rollback: keep a copy of the previous `Models/quant_model.pkl` before retraining; run `walk-forward-oos` to detect a bad retrain and restore the copy.
 
 ## Alerts on failure
 

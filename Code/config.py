@@ -8,8 +8,6 @@ load_dotenv(BASE_DIR / '.env')
 # ── API Keys ───────────────────────────────────────────────────────────────
 ALPACA_API_KEY     = os.getenv('ALPACA_API_KEY', '')
 ALPACA_SECRET_KEY  = os.getenv('ALPACA_SECRET_KEY', '')
-DISCORD_WEBHOOK_URL = os.getenv('Discord_Webhook', '')
-OPEN_ROUTER_API_KEY = os.getenv('OPEN_ROUTER_API_KEY', '')
 
 # ── Watchlist ──────────────────────────────────────────────────────────────
 WATCHLIST = {
@@ -85,7 +83,6 @@ STRUCTURAL_STOP_MIN_DISTANCE = 0.01  # minimum 1% below entry; VWAP used if deep
 
 # ── Volatility / Macro Gates ───────────────────────────────────────────────
 VIX_HARD_BLOCK       = 30    # no new trades when spot VIX >= this
-DAILY_LOSS_LIMIT_PCT = 0.03  # circuit breaker: halt trading if total P&L < -3% equity
 
 # ── Signal Scoring ─────────────────────────────────────────────────────────
 # Max base score is now 135 (added RSI=20 + MACD=15 on top of original 100).
@@ -110,21 +107,9 @@ MACD_SIGNAL_PERIOD  = 9
 # ── Volume Thresholds ──────────────────────────────────────────────────────
 VOLUME_SPIKE_MULTIPLIER    = 1.5   # min spike indicating compression exit
 BREAKOUT_VOLUME_MULTIPLIER = 1.8   # confirms breakout
-ATR_CONTRACTION_THRESHOLD  = 0.85  # ATR < 85% of reference = compression
-
-# ── Relative Strength ──────────────────────────────────────────────────────
-RS_PERIOD_DAYS = 5                 # 5-day return vs QQQ
-
-# ── LLM (OpenRouter free tier only) ───────────────────────────────────────
-LLM_MODEL = 'meta-llama/llama-3.3-70b-instruct:free'
 
 # ── File Paths ─────────────────────────────────────────────────────────────
-DB_PATH               = BASE_DIR / 'trading.db'
-LOGS_DIR              = BASE_DIR / 'Logs'
-RESEARCH_DIR          = BASE_DIR / 'Metholody' / 'Research'
-PORTFOLIO_STATUS_PATH = BASE_DIR / 'Metholody' / 'portfolio_status.md'
-STRATEGY_PATH         = BASE_DIR / 'Metholody' / 'Rules' / 'Strategy.md'
-TRADING_STATS_CSV     = LOGS_DIR / 'trading_stats.csv'
+LOGS_DIR              = BASE_DIR / 'Logs'   # backtest / tuning result CSVs
 
 # ── ML Model ───────────────────────────────────────────────────────────────
 MODELS_DIR            = BASE_DIR / 'Models'

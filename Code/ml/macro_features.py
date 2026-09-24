@@ -21,7 +21,7 @@ don't hammer yfinance on every training run.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 import sys
 import warnings

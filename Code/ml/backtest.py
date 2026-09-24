@@ -23,7 +23,6 @@ Usage:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 import sys
 
@@ -34,8 +33,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
     ML_FEATURES_PATH, ML_RAW_BARS_PATH, LOGS_DIR,
     SIGNAL_BUY_THRESHOLD, ML_CONFIDENCE_THRESHOLD,
-    RISK_PER_TRADE, MAX_POSITIONS, MAX_STOCK_CONCENTRATION,
-    HARD_STOP_LOSS_PCT, TAKE_PROFIT_PCT, TP1_PCT, TP1_SHARE_FRACTION,
+    RISK_PER_TRADE, MAX_STOCK_CONCENTRATION,
+    HARD_STOP_LOSS_PCT,
     ML_LABEL_TIMEOUT_BARS, ML_LABEL_TP_PCT,
     WATCHLIST,
 )
@@ -396,7 +395,7 @@ def run_oos_backtest(
 
     Returns the same dict shape as run_backtest().
     """
-    from ml.features import FEATURE_COLS, ML_TRAINING_FEATURES, compute_signal_score_col
+    from ml.features import ML_TRAINING_FEATURES, compute_signal_score_col
     from ml.train import fit_with_threshold_holdout
     from config import ML_SIGNAL_SCORE_THRESHOLD
 
@@ -520,7 +519,7 @@ def run_walk_forward_oos(
 
     Returns dict with per-fold results AND aggregated mean/stdev metrics.
     """
-    from ml.features import FEATURE_COLS, ML_TRAINING_FEATURES, compute_signal_score_col
+    from ml.features import ML_TRAINING_FEATURES, compute_signal_score_col
     from ml.train import fit_with_threshold_holdout
     from config import ML_SIGNAL_SCORE_THRESHOLD
 

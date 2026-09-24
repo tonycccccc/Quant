@@ -1,12 +1,12 @@
 """
 Advisory Mode — ask the model about a specific ticker.
 
-Runs the full RATMB pipeline on demand for a single symbol and returns:
+Runs the momentum pipeline for a symbol and returns:
   - Rule-based score with per-category breakdown
   - ML confidence + gate decision (using bundle-tuned threshold)
   - Suggested entry, TP1/TP2, ATR-aware stop, position size, risk
-  - Model context (OOS win rate, avg win/loss) so you can gauge trust
   - Regime context (VIX term, SPY/QQQ EMA alignment)
+  - Fundamental context and fair-value buy price
 
 Default reads from cached Models/raw_bars.parquet (fresh if daily-update ran
 this morning). Pass --refresh to force a live Alpaca fetch.
@@ -18,7 +18,7 @@ CLI:
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 import sys
 
@@ -28,186 +28,110 @@ import pytz
 
 sys.path.insert(0, str(Path(__file__).parent))
 from config import (
-    ML_RAW_BARS_PATH, WATCHLIST, ML_EXTRA_TRAINING_SYMBOLS,
+    ML_RAW_BARS_PATH, MARKET_INDEXES,
     RISK_PER_TRADE, MAX_STOCK_CONCENTRATION,
-    HARD_STOP_LOSS_PCT, TAKE_PROFIT_PCT, TP1_PCT, TP1_SHARE_FRACTION,
+    TAKE_PROFIT_PCT, TP1_PCT, TP1_SHARE_FRACTION,
     STRUCTURAL_STOP_MIN_DISTANCE,
     SIGNAL_BUY_THRESHOLD, SIGNAL_WATCH_THRESHOLD,
-    ML_CONFIDENCE_THRESHOLD, ML_ENABLED, VIX_HARD_BLOCK,
+    ML_ENABLED, VIX_HARD_BLOCK,
 )
 import technicals as ta
 
 ET = pytz.timezone('America/New_York')
 
 
-# ── Cache helpers ─────────────────────────────────────────────────────────
+# ── Shared pipeline (also used by scan_momentum) ──────────────────────────
 
-def _load_cached_bars() -> tuple:
-    """
-    Load raw_bars.parquet (from daily-update). Returns (df, age_hours).
-    Raises FileNotFoundError if cache is missing.
-    """
+def load_bars(refresh: bool = False) -> pd.DataFrame:
+    """MultiIndex (symbol, timestamp) bars: cached by default, live with refresh."""
+    if refresh:
+        from ml.collect import fetch_recent
+        print('[advise] Fetching live bars for the full universe...')
+        return fetch_recent(days_back=90)
     if not ML_RAW_BARS_PATH.exists():
         raise FileNotFoundError(
             f'No cached bars at {ML_RAW_BARS_PATH}. '
             f'Run `python Code/main.py daily-update` first or use --refresh.'
         )
-    df = pd.read_parquet(ML_RAW_BARS_PATH)
     age = (datetime.now().timestamp() - ML_RAW_BARS_PATH.stat().st_mtime) / 3600
-    return df, age
+    print(f'[advise] Using cached bars (age: {age:.1f}h). Pass --refresh for live fetch.')
+    return pd.read_parquet(ML_RAW_BARS_PATH)
 
 
-def _fetch_fresh_bars(ticker: str) -> pd.DataFrame:
-    """Fetch 90 days of live 30-min bars for a single ticker + QQQ + SPY."""
-    from phase1_polling import fetch_bars
-    tickers = list({ticker, 'QQQ', 'SPY'} | set(WATCHLIST.keys()))
-    all_bars = fetch_bars(tickers, days_back=90)
-    return all_bars
+def market_context(bars: pd.DataFrame) -> tuple[dict, dict]:
+    """Return (macro, regime): VIX/put-call features and SPY/QQQ EMA regime."""
+    from ml.macro_features import get_latest_macro
+    macro = get_latest_macro()
+    symbols = bars.index.get_level_values(0)
 
-
-# ── Cross-sectional rank helper ───────────────────────────────────────────
-
-def _compute_ranks_across_watchlist(all_bars_indexed, target: str) -> dict:
-    """
-    Compute cross-sectional ranks (rs_rank_5d, rsi_rank, momentum_rank_20d,
-    vol_ratio_rank) across all in-cache watchlist tickers. Returns target's rank.
-    """
-    import pandas as pd
-    rows = {}
-    tickers = list(WATCHLIST.keys())
-    if target not in tickers:
-        tickers.append(target)
-
-    for t in tickers:
-        try:
-            df = all_bars_indexed.loc[t]
-        except (KeyError, TypeError):
-            continue
-        if len(df) < 100:
-            continue
-        indicators = ta.compute_indicators(df)
-        if indicators is None:
-            continue
-        bar_close = df['close']
-        prior_5d = float(bar_close.iloc[-1] / bar_close.iloc[-66] - 1) if len(bar_close) >= 66 else 0.0
-        vol_ratio = (indicators.get('volume', 0.0) / indicators['volume_avg']) \
-            if indicators.get('volume_avg', 0) > 0 else 1.0
-        # d_return_20d proxy: 20 trading days ~= 260 30-min bars
-        try:
-            idx_et = df.index.tz_convert('America/New_York') if df.index.tz else df.index
-            d = df.copy(); d.index = idx_et
-            by_day = d.resample('B').agg(close=('close', 'last')).dropna()
-            d_return_20d = float(by_day['close'].iloc[-1] / by_day['close'].iloc[-21] - 1) \
-                if len(by_day) >= 21 else 0.0
-        except Exception:
-            d_return_20d = 0.0
-        rows[t] = {
-            'prior_5d_return': prior_5d,
-            'rsi':             float(indicators.get('rsi', 50.0)),
-            'd_return_20d':    d_return_20d,
-            'vol_ratio':       float(vol_ratio),
-        }
-
-    if target not in rows:
-        return {'rs_rank_5d': 0.5, 'rsi_rank': 0.5,
-                 'momentum_rank_20d': 0.5, 'vol_ratio_rank': 0.5}
-    cross = pd.DataFrame(rows).T
-    rank_map = {'prior_5d_return': 'rs_rank_5d',
-                'rsi':             'rsi_rank',
-                'd_return_20d':    'momentum_rank_20d',
-                'vol_ratio':       'vol_ratio_rank'}
-    out = {}
-    for src, dst in rank_map.items():
-        ranks = cross[src].rank(pct=True, method='average').fillna(0.5)
-        out[dst] = float(ranks[target])
-    return out
-
-
-# ── Regime determination ─────────────────────────────────────────────────
-
-def _get_regime_context(spy_df, qqq_df, macro: dict) -> dict:
-    """
-    Compute macro regime context: SPY/QQQ EMA alignment + VIX term structure.
-    Returns dict with regime_bias, spy_ema_aligned, qqq_ema_aligned.
-    """
-    def _aligned(df):
-        if df is None or len(df) < 55:
+    def _aligned(sym):
+        if sym not in symbols:
             return 0.0
-        c = df['close']
+        c = bars.loc[sym]['close']
+        if len(c) < 55:
+            return 0.0
         return float(c.ewm(span=20, adjust=False).mean().iloc[-1] >
                      c.ewm(span=50, adjust=False).mean().iloc[-1])
 
-    spy_ema = _aligned(spy_df)
-    qqq_ema = _aligned(qqq_df)
-
-    # Simple regime bias mapping
+    spy_ema, qqq_ema = _aligned('SPY'), _aligned('QQQ')
     if spy_ema and qqq_ema:
         regime_bias, regime_conf = 'bullish', 0.75
     elif not spy_ema and not qqq_ema:
         regime_bias, regime_conf = 'bearish', 0.75
     else:
         regime_bias, regime_conf = 'neutral', 0.50
-
-    return {
-        'spy_ema_aligned':  spy_ema,
-        'qqq_ema_aligned':  qqq_ema,
-        'regime_bias':      regime_bias,
-        'regime_conf':      regime_conf,
-        'vix_backwardation': macro.get('vix_term_ratio', 1.0) > 1.0,
+    regime = {
+        'spy_ema_aligned': spy_ema,
+        'qqq_ema_aligned': qqq_ema,
+        'regime_bias':     regime_bias,
+        'regime_conf':     regime_conf,
     }
+    return macro, regime
 
 
-# ── Main advisory function ───────────────────────────────────────────────
-
-def advise(ticker: str, equity: float = 10_000.0,
-            refresh: bool = False, verbose: bool = False) -> dict:
+def compute_ranks(bars: pd.DataFrame) -> pd.DataFrame:
     """
-    Run the full RATMB pipeline for one ticker and print the advisory report.
-    Returns a dict with all computed values for programmatic use.
+    Cross-sectional percentile ranks of each symbol's latest bar across the
+    whole non-index universe — the same universe training ranks against.
     """
-    ticker = ticker.upper()
+    rows = {}
+    for sym in bars.index.get_level_values(0).unique():
+        if sym in MARKET_INDEXES:
+            continue
+        df = bars.loc[sym]
+        if len(df) < 100:
+            continue
+        ind = ta.compute_indicators(df)
+        if ind is None:
+            continue
+        close = df['close']
+        by_day = close.resample('B').last().dropna()
+        rows[sym] = {
+            # 65 bars = 5 trading days of 30-min bars
+            'rs_rank_5d':        float(close.iloc[-1] / close.iloc[-66] - 1) if len(close) >= 66 else 0.0,
+            'rsi_rank':          float(ind.get('rsi', 50.0)),
+            'momentum_rank_20d': float(by_day.iloc[-1] / by_day.iloc[-21] - 1) if len(by_day) >= 21 else 0.0,
+            'vol_ratio_rank':    float(ind['volume'] / ind['volume_avg']) if ind.get('volume_avg', 0) > 0 else 1.0,
+        }
+    return pd.DataFrame(rows).T.rank(pct=True, method='average').fillna(0.5)
 
-    # ── 1. Load bar data ─────────────────────────────────────────────────
-    if refresh:
-        print(f'[advise] Fetching fresh bars for {ticker} + watchlist...')
-        all_bars = _fetch_fresh_bars(ticker)
-        # phase1_polling.fetch_bars returns dict; convert to indexed df
-        combined = []
-        for t, df in all_bars.items():
-            df2 = df.copy()
-            df2['symbol'] = t
-            combined.append(df2.set_index([pd.Index([t]*len(df2)), df2.index]))
-        cached = pd.concat(combined) if combined else None
-        age_hours = 0
-    else:
-        cached, age_hours = _load_cached_bars()
-        print(f'[advise] Using cached bars (age: {age_hours:.1f}h). '
-              f'Pass --refresh for live fetch.')
 
-    if ticker not in cached.index.get_level_values(0):
-        raise ValueError(
-            f'{ticker} not found in cache. Available: '
-            f'{sorted(cached.index.get_level_values(0).unique().tolist())[:20]}...'
-        )
+def evaluate(ticker: str, bars: pd.DataFrame, macro: dict, regime: dict,
+             ranks: pd.DataFrame, equity: float = 10_000.0) -> dict | None:
+    """Score one ticker: rule score, ML gate, recommendation and entry plan.
 
-    df     = cached.loc[ticker]
-    qqq_df = cached.loc['QQQ'] if 'QQQ' in cached.index.get_level_values(0) else None
-    spy_df = cached.loc['SPY'] if 'SPY' in cached.index.get_level_values(0) else None
-
+    Returns None when the ticker lacks enough bars for indicators.
+    """
+    if ticker not in bars.index.get_level_values(0):
+        return None
+    df = bars.loc[ticker]
+    qqq_df = bars.loc['QQQ'] if 'QQQ' in bars.index.get_level_values(0) else None
     if len(df) < 100:
-        raise ValueError(f'{ticker} has only {len(df)} bars — need at least 100 for indicators')
-
-    # ── 2. Compute indicators ────────────────────────────────────────────
+        return None
     indicators = ta.compute_indicators(df)
     if indicators is None:
-        raise ValueError(f'Could not compute indicators for {ticker}')
+        return None
 
-    # ── 3. Fetch macro features (VIX term + put/call, uses 24h cache) ────
-    from ml.macro_features import get_latest_macro
-    macro = get_latest_macro()
-
-    # ── 4. Regime context ────────────────────────────────────────────────
-    regime = _get_regime_context(spy_df, qqq_df, macro)
     indicators.update({
         'spy_ema_aligned':  regime['spy_ema_aligned'],
         'qqq_ema_aligned':  regime['qqq_ema_aligned'],
@@ -216,37 +140,26 @@ def advise(ticker: str, equity: float = 10_000.0,
         'vix_term_ratio':   macro['vix_term_ratio'],
         'put_call_ratio':   macro['put_call_ratio'],
     })
+    if ticker in ranks.index:
+        indicators.update(ranks.loc[ticker].to_dict())
 
-    # ── 5. Cross-sectional ranks ─────────────────────────────────────────
-    ranks = _compute_ranks_across_watchlist(cached, ticker)
-    indicators.update(ranks)
-
-    # ── 6. Relative strength vs QQQ ──────────────────────────────────────
     rs = ta.compute_rs_vs_qqq(df, qqq_df) if qqq_df is not None else 0.0
-
-    # ── 7. Rule-based score ──────────────────────────────────────────────
     base_score, components = ta.score_signal(indicators, rs)
     final_score = ta.apply_regime_multiplier(
         base_score, regime['regime_bias'], regime['regime_conf'],
     )
+    indicators['primary_base_score'] = round(base_score, 1)
 
-    # ── 8. ML probability ───────────────────────────────────────────────
     from ml.features import indicators_to_feature_row
-    from ml.predict import predict_success_prob, get_threshold, model_info
-
+    from ml.predict import predict_success_prob, get_threshold
     feature_row = indicators_to_feature_row(indicators, df, df.index[-1], rs_vs_qqq=rs)
     ml_prob = predict_success_prob(feature_row) if ML_ENABLED else float('nan')
     ml_threshold = get_threshold() if ML_ENABLED else 0.55
-    bundle_info = model_info()
 
-    # ── 9. Entry / exit plan ─────────────────────────────────────────────
-    from phase2_execution import PortfolioManager
     entry_price = indicators['close']
     vwap        = indicators.get('vwap', 0.0)
     d_atr_pct   = indicators.get('d_atr_pct', 0.02) or (indicators['atr'] / entry_price)
-
-    pm = PortfolioManager.__new__(PortfolioManager)   # skip __init__ (no Alpaca client needed)
-    sl_price = pm._compute_stop(entry_price, vwap, d_atr_pct=d_atr_pct)
+    sl_price = ta.compute_stop(entry_price, vwap, d_atr_pct=d_atr_pct)
     stop_distance = entry_price - sl_price
     tp1_price = round(entry_price * (1 + TP1_PCT),        2)
     tp2_price = round(entry_price * (1 + TAKE_PROFIT_PCT), 2)
@@ -265,36 +178,22 @@ def advise(ticker: str, equity: float = 10_000.0,
     exposure    = shares * entry_price
     risk        = shares * stop_distance
 
-    # ── 10. Recommendation ──────────────────────────────────────────────
-    if final_score >= SIGNAL_BUY_THRESHOLD and (np.isnan(ml_prob) or ml_prob >= ml_threshold):
-        recommendation = '🟢 BUY SIGNAL'
-        rec_class = 'BUY'
-    elif final_score >= SIGNAL_BUY_THRESHOLD:
-        recommendation = '🟡 WATCH — score OK but ML gate failed'
-        rec_class = 'WATCH'
-    elif final_score >= SIGNAL_WATCH_THRESHOLD:
-        recommendation = '🟡 WATCH — score below BUY threshold'
-        rec_class = 'WATCH'
-    else:
-        recommendation = '⚪ SKIP — insufficient signal'
-        rec_class = 'SKIP'
-
-    # VIX hard block warning
-    vix_spot = macro.get('vix_9d', 0)  # closest proxy
+    vix_spot = macro.get('vix_9d', 0)  # closest available proxy for spot VIX
     if vix_spot >= VIX_HARD_BLOCK:
-        recommendation = f'🚫 BLOCKED — VIX={vix_spot:.1f} >= {VIX_HARD_BLOCK}'
-        rec_class = 'BLOCKED'
+        rec_class, reason = 'BLOCKED', f'VIX={vix_spot:.1f} >= {VIX_HARD_BLOCK}'
+    elif final_score >= SIGNAL_BUY_THRESHOLD and (np.isnan(ml_prob) or ml_prob >= ml_threshold):
+        rec_class, reason = 'BUY', 'score and ML gate pass'
+    elif final_score >= SIGNAL_BUY_THRESHOLD:
+        rec_class, reason = 'WATCH', 'score OK but ML gate failed'
+    elif final_score >= SIGNAL_WATCH_THRESHOLD:
+        rec_class, reason = 'WATCH', 'score below BUY threshold'
+    else:
+        rec_class, reason = 'SKIP', 'insufficient signal'
 
-    # ── 10b. Fundamentals (advisory context — does NOT change trading logic) ──
-    try:
-        from ml.fundamentals import get_ticker as get_fundamentals
-        fund = get_fundamentals(ticker)
-    except Exception as e:
-        print(f'  [advise] fundamentals fetch failed: {e}')
-        fund = {}
-
-    result = {
+    return {
         'ticker':         ticker,
+        'indicators':     indicators,
+        'reason':         reason,
         'as_of':          df.index[-1].isoformat(),
         'price':          entry_price,
         'recommendation': rec_class,
@@ -317,9 +216,29 @@ def advise(ticker: str, equity: float = 10_000.0,
         'exposure':       exposure,
         'risk_dollars':   risk,
         'equity':         equity,
-        'fundamentals':   fund,
     }
-    _print_report(result, indicators, bundle_info, verbose=verbose)
+
+
+def advise(ticker: str, equity: float = 10_000.0,
+           refresh: bool = False, verbose: bool = False) -> dict:
+    """Run the momentum pipeline + fundamentals for one ticker and print the report."""
+    ticker = ticker.upper()
+    bars = load_bars(refresh)
+    macro, regime = market_context(bars)
+    result = evaluate(ticker, bars, macro, regime, compute_ranks(bars), equity)
+    if result is None:
+        raise ValueError(f'{ticker}: not in bar data or fewer than 100 bars')
+
+    # Fundamentals are advisory context only — they never change the signal.
+    try:
+        from ml.fundamentals import get_ticker
+        result['fundamentals'] = get_ticker(ticker)
+    except Exception as e:
+        print(f'  [advise] fundamentals fetch failed: {e}')
+        result['fundamentals'] = {}
+
+    from ml.predict import model_info
+    _print_report(result, result['indicators'], model_info(), verbose=verbose)
     return result
 
 
@@ -406,25 +325,31 @@ def _print_report(r: dict, indicators: dict, bundle_info, verbose: bool = False)
         print(f'    Analysts:     {rec_label} (mean {_num(rec, 2)}) '
               f'| target {_price(target)} '
               f'({("+" if upside and upside > 0 else "")+f"{upside:.1%}" if upside is not None else "N/A"} upside)')
-        # Fair value estimate (growth-adjusted, independent of analyst targets)
+        # Fair value estimate — sector-appropriate methodology
         try:
             from ml.fundamentals import compute_fair_value
             fv = compute_fair_value(pd.Series(fund))
-            if fv:
-                print(f'\n    FAIR VALUE ESTIMATE (growth-adjusted):')
-                print(f'      Forward EPS:       ${fv["forward_eps"]:.2f}  (price / forward_PE)')
-                print(f'      Sustainable growth: {fv["sustainable_growth"]*100:+.1f}%  (60% rev + 40% earn)')
-                tier = ('hyper-growth' if fv['sustainable_growth'] > 0.30
-                          else 'strong growth' if fv['sustainable_growth'] > 0.15
-                          else 'mature' if fv['sustainable_growth'] > 0.05
-                          else 'slow' if fv['sustainable_growth'] > 0
-                          else 'declining')
-                adj = f'base {fv["base_pe"]}x ({tier}) × ROE {fv["roe_mult"]:.2f}'
-                if fv.get('cyclical_note'):
-                    adj += f', {fv["cyclical_note"]}'
-                print(f'      Fair PE:            {fv["fair_pe"]}x  ({adj})')
+            if fv and 'fair_value' not in fv:
+                print(f'\n    FAIR VALUE ESTIMATE: unavailable ({fv.get("data_quality", "insufficient data")})')
+            elif fv:
+                method = fv.get('method', 'default')
+                method_label = {
+                    'semi':         'semiconductor FCF DCF',
+                    'saas':         'SaaS FCF DCF',
+                    'sum_of_parts': 'segment sum-of-parts DCF',
+                    'default':      'growth-tier P/E screen',
+                }.get(method, method)
+                print(f'\n    FAIR VALUE ESTIMATE ({method_label}):')
+                if fv.get('method_detail'):
+                    print(f'      {fv["method_detail"]}')
+                if 'growth_start' in fv:
+                    print(f'      Revenue growth:     {fv["growth_start"]*100:+.1f}% -> '
+                          f'{fv["growth_end"]*100:+.1f}% (yr1 -> yr5, anchored on history)')
+                    print(f'      FCF margin (TTM):   {fv["fcf_margin"]*100:.1f}%   '
+                          f'WACC {fv["wacc"]*100:.1f}%, terminal g {fv["terminal_growth"]*100:.1f}%')
                 print(f'      Fair value:         ${fv["fair_value"]:.2f}')
-                disc = fv["discount_to_fair"]
+                print(f'      Buy price ({fv["margin_of_safety"]:.0%} MoS): ${fv["buy_price"]:.2f}')
+                disc = fv["upside_to_fair_value"]
                 verdict_price = ('🟢 UNDERVALUED' if disc > 0.10
                                   else '🟡 fair' if disc > -0.10
                                   else '🟠 overvalued' if disc > -0.25
@@ -455,7 +380,8 @@ def _print_report(r: dict, indicators: dict, bundle_info, verbose: bool = False)
         print(f'\n  FUNDAMENTAL CONTEXT: unavailable (yfinance fetch failed for {r["ticker"]})')
 
     # ── Recommendation ────────────────────────────────────────────────────
-    print(f'\n  RECOMMENDATION: {"🟢 BUY SIGNAL" if r["recommendation"] == "BUY" else "🟡 WATCH" if r["recommendation"] == "WATCH" else "⚪ SKIP" if r["recommendation"] == "SKIP" else "🚫 BLOCKED"}')
+    label = {'BUY': '🟢 BUY SIGNAL', 'WATCH': '🟡 WATCH', 'SKIP': '⚪ SKIP'}.get(r['recommendation'], '🚫 BLOCKED')
+    print(f'\n  RECOMMENDATION: {label} — {r["reason"]}')
 
     # ── Entry plan ────────────────────────────────────────────────────────
     print(f'\n  ENTRY PLAN (equity assumption: ${r["equity"]:,.0f}):')
@@ -475,19 +401,11 @@ def _print_report(r: dict, indicators: dict, bundle_info, verbose: bool = False)
     print(f'    Risk:                    ${r["risk_dollars"]:>8,.0f}  '
           f'({r["risk_dollars"]/r["equity"]*100:>4.1f}% of equity — target {RISK_PER_TRADE:.1%})')
 
-    # ── Historical context ────────────────────────────────────────────────
-    print(f'\n  HISTORICAL CONTEXT (walk-forward OOS, 60-mo history):')
-    print(f'    Rule-only mean vs QQQ:   +11.23% per 6-month period, 4/5 folds beat QQQ')
-    print(f'    Rule+ML mean vs QQQ:     +7.72% per 6-month period, Sharpe 1.04')
-    print(f'    Typical win/loss:        avg TP hit +10%, avg SL hit -3.5%')
-    print(f'    Backtest win rate:       ~37% (asymmetric bracket: 3:1 reward/risk)')
-
     # ── Caveats ──────────────────────────────────────────────────────────
     print(f'\n  CAVEATS:')
     if r['recommendation'] == 'BUY':
-        print(f'    - Phase 0 clearance NOT checked here (earnings / macro veto)')
+        print(f'    - Earnings dates and macro events are NOT checked — verify before entry')
         print(f'    - Assumes {r["equity"]:,.0f} equity; adjust with --equity')
-        print(f'    - Rule-only variant has BEST return; consider ignoring ML gate for max upside')
     if reg["regime_bias"] == "bearish":
         print(f'    - Regime is BEARISH — reduce size or wait for regime flip')
     if m["vix_term_ratio"] > 1.05:

@@ -1,31 +1,16 @@
-"""
-Fundamentals module — yfinance-based company fundamentals for advisor context.
+"""Fundamentals module: valuation context for semiconductor and SaaS stocks.
 
-Purpose: give the advisor a "second opinion" alongside the technical signal.
-Fundamentals are ADVISORY ONLY — they don't trigger trades, don't change
-stops, don't override the technical filters. They INFORM decisions when
-the technical signal already fires.
-
-Metrics fetched (per ticker, cached daily):
-  - Valuation:      forward_pe, trailing_pe, peg_ratio
-  - Growth:         revenue_growth (YoY), earnings_growth (YoY)
-  - Profitability:  profit_margin, roe (return on equity)
-  - Balance sheet:  debt_to_equity, free_cashflow
-  - Analyst:        rec_mean (1=strong buy, 5=strong sell), target_price
-  - Meta:           market_cap, sector, fetched_at
-
-Quality score (0-100) aggregates these into a single number using
-threshold-based buckets calibrated to a tech-heavy universe.
-
-Cache: Models/fundamentals.parquet, refreshed daily (24h TTL).
-Auto-refreshed by daily-update.
+This is an advisory screening model, not a forecast or trade signal. It uses
+yfinance fields, which can be stale or inconsistently defined. Inspect the
+returned assumptions and data quality before relying on an output.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 import sys
 import warnings
+import json
 
 import numpy as np
 import pandas as pd
@@ -34,434 +19,501 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import MODELS_DIR, WATCHLIST, ML_EXTRA_TRAINING_SYMBOLS
 
 FUNDAMENTALS_CACHE_PATH = MODELS_DIR / 'fundamentals.parquet'
+_ALL_SYMBOLS = list(dict.fromkeys(list(WATCHLIST.keys()) + list(ML_EXTRA_TRAINING_SYMBOLS)))
+DEFAULT_MARGIN_OF_SAFETY = 0.25
+_MEMORY_TICKERS = {'MU', 'WDC', 'STX', 'SNDK'}
+SEGMENT_DISCLOSURES_PATH = Path(__file__).parent / 'segment_disclosures.json'
+# Multi-segment companies: a single consolidated DCF would blend businesses
+# with different growth, margins and capital intensity, so they are valued
+# only via sum-of-parts from filed segment data.
+_SEGMENT_REQUIRED = {
+    'MSFT': 'Productivity & Business Processes, Intelligent Cloud, More Personal Computing',
+}
 
-# All symbols we might want fundamentals for
-_ALL_SYMBOLS = list(WATCHLIST.keys()) + list(ML_EXTRA_TRAINING_SYMBOLS)
+
+def _num(value, default=np.nan):
+    """Return a finite float or a default; handles None, pandas NA and inf."""
+    try:
+        value = float(value)
+        return value if np.isfinite(value) else default
+    except (TypeError, ValueError):
+        return default
 
 
-# ── Fetch from yfinance ───────────────────────────────────────────────────
+def _row_num(row, key, default=np.nan):
+    return _num(row.get(key, default), default)
+
+
+def _quarterly_fcf_ttm(ticker) -> float:
+    """Sum the latest four quarterly FCF observations to align with TTM revenue."""
+    try:
+        cashflow = ticker.quarterly_cashflow
+        if cashflow is None or cashflow.empty:
+            return np.nan
+        label = next((name for name in ('Free Cash Flow', 'FreeCashFlow')
+                      if name in cashflow.index), None)
+        if label:
+            values = pd.to_numeric(cashflow.loc[label], errors='coerce').dropna()
+            values = values.sort_index(ascending=False).head(4)
+            return float(values.sum()) if len(values) == 4 else np.nan
+        # Fallback when the provider omits its FCF row: CFO + CapEx (CapEx
+        # is generally represented as a negative cash flow in yfinance).
+        cfo = next((name for name in ('Operating Cash Flow', 'OperatingCashFlow')
+                    if name in cashflow.index), None)
+        capex = next((name for name in ('Capital Expenditure', 'CapitalExpenditures')
+                      if name in cashflow.index), None)
+        if cfo and capex:
+            cfo_values = pd.to_numeric(cashflow.loc[cfo], errors='coerce').dropna().sort_index(ascending=False).head(4)
+            capex_values = pd.to_numeric(cashflow.loc[capex], errors='coerce').dropna().sort_index(ascending=False).head(4)
+            if len(cfo_values) == 4 and len(capex_values) == 4:
+                return float(cfo_values.sum() + capex_values.sum())
+    except Exception:
+        pass
+    return np.nan
+
 
 def _fetch_one_ticker(ticker: str) -> dict:
-    """
-    Fetch fundamental fields for one ticker via yfinance.
-
-    Returns dict with fields; None/np.nan for missing values.
-    yfinance is inconsistent — most fields will be there, some won't.
-    """
     import yfinance as yf
     try:
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
             t = yf.Ticker(ticker)
             info = t.info or {}
-    except Exception as e:
-        print(f'  [fundamentals] {ticker}: fetch failed: {e}')
-        return {'ticker': ticker, 'fetched_at': datetime.now().isoformat(),
-                 'fetch_ok': False}
-
+    except Exception as exc:
+        print(f'  [fundamentals] {ticker}: fetch failed: {exc}')
+        return {'ticker': ticker, 'fetched_at': datetime.now().isoformat(), 'fetch_ok': False}
     if not info or info.get('quoteType') is None:
-        print(f'  [fundamentals] {ticker}: empty info')
-        return {'ticker': ticker, 'fetched_at': datetime.now().isoformat(),
-                 'fetch_ok': False}
+        return {'ticker': ticker, 'fetched_at': datetime.now().isoformat(), 'fetch_ok': False}
 
-    def _get(key, default=np.nan):
-        v = info.get(key)
-        try:
-            return float(v) if v is not None else default
-        except (TypeError, ValueError):
-            return default
+    def get(key):
+        return _num(info.get(key))
 
+    price = get('currentPrice')
+    if not np.isfinite(price) or price <= 0:
+        price = get('regularMarketPrice')
+
+    # Annual reported revenue history. Useful as a company-specific anchor,
+    # though acquisitions and fiscal-year changes can distort these growth rates.
+    history = []
+    try:
+        statement = t.income_stmt
+        if statement is not None and not statement.empty:
+            label = next((k for k in ('Total Revenue', 'TotalRevenue') if k in statement.index), None)
+            if label:
+                values = pd.to_numeric(statement.loc[label], errors='coerce').dropna().sort_index()
+                history = [float(v) for v in values.tail(6).tolist() if np.isfinite(v) and v > 0]
+    except Exception:
+        history = []
+    annual_growths = [history[i] / history[i - 1] - 1 for i in range(1, len(history)) if history[i - 1] > 0]
+    historical_growth_median = float(np.median(annual_growths)) if annual_growths else np.nan
+    historical_growth_volatility = float(np.std(annual_growths, ddof=1)) if len(annual_growths) > 1 else np.nan
+    fcf_ttm = _quarterly_fcf_ttm(t)
+    fcf_source = 'quarterly_cashflow_ttm'
+    if not np.isfinite(fcf_ttm):
+        fcf_ttm = get('freeCashflow')
+        fcf_source = 'yfinance_info_fallback'
     return {
-        'ticker':             ticker,
-        'fetched_at':         datetime.now().isoformat(),
-        'fetch_ok':           True,
-        'sector':             info.get('sector', ''),
-        'industry':           info.get('industry', ''),
-        'market_cap':         _get('marketCap'),
-        'current_price':      _get('currentPrice') or _get('regularMarketPrice'),
-        # Valuation
-        'forward_pe':         _get('forwardPE'),
-        'trailing_pe':        _get('trailingPE'),
-        'peg_ratio':          _get('trailingPegRatio') or _get('pegRatio'),
-        'price_to_book':      _get('priceToBook'),
-        'price_to_sales':     _get('priceToSalesTrailing12Months'),
-        # Growth (yfinance returns fractions, e.g. 0.43 = 43%)
-        'revenue_growth':     _get('revenueGrowth'),
-        'earnings_growth':    _get('earningsGrowth'),
-        # Profitability
-        'profit_margin':      _get('profitMargins'),
-        'operating_margin':   _get('operatingMargins'),
-        'roe':                _get('returnOnEquity'),
-        'roa':                _get('returnOnAssets'),
-        # Balance sheet
-        'debt_to_equity':     _get('debtToEquity'),   # often reported as *100
-        'current_ratio':      _get('currentRatio'),
-        'free_cashflow':      _get('freeCashflow'),
-        # Analyst sentiment
-        'analyst_rec_mean':   _get('recommendationMean'),
-        'analyst_target':     _get('targetMeanPrice'),
-        'num_analysts':       _get('numberOfAnalystOpinions'),
-        # Beta (for context)
-        'beta':               _get('beta'),
+        'ticker': ticker, 'fetched_at': datetime.now().isoformat(), 'fetch_ok': True,
+        'sector': info.get('sector', ''), 'industry': info.get('industry', ''),
+        'market_cap': get('marketCap'), 'current_price': price,
+        'forward_pe': get('forwardPE'), 'trailing_pe': get('trailingPE'),
+        'peg_ratio': get('trailingPegRatio') if np.isfinite(get('trailingPegRatio')) else get('pegRatio'),
+        'price_to_book': get('priceToBook'), 'price_to_sales': get('priceToSalesTrailing12Months'),
+        'revenue_growth': get('revenueGrowth'), 'earnings_growth': get('earningsGrowth'),
+        'historical_revenue_growth_median': historical_growth_median,
+        'historical_revenue_growth_volatility': historical_growth_volatility,
+        # yfinance does not expose RPO/backlog consistently. Populate these
+        # from filings or earnings releases when available; leave missing otherwise.
+        'rpo': np.nan, 'rpo_next_12m': np.nan, 'rpo_growth': np.nan,
+        'profit_margin': get('profitMargins'), 'operating_margin': get('operatingMargins'),
+        'gross_margin': get('grossMargins'), 'roe': get('returnOnEquity'), 'roa': get('returnOnAssets'),
+        'enterprise_value': get('enterpriseValue'), 'total_revenue': get('totalRevenue'),
+        'ebitda': get('ebitda'), 'ev_to_ebitda': get('enterpriseToEbitda'),
+        'ev_to_revenue': get('enterpriseToRevenue'), 'total_debt': get('totalDebt'),
+        'total_cash': get('totalCash'), 'shares_outstanding': get('sharesOutstanding'),
+        'debt_to_equity': get('debtToEquity'), 'current_ratio': get('currentRatio'),
+        'free_cashflow': fcf_ttm, 'free_cashflow_source': fcf_source,
+        'analyst_rec_mean': get('recommendationMean'),
+        'analyst_target': get('targetMeanPrice'), 'num_analysts': get('numberOfAnalystOpinions'),
+        'beta': get('beta'),
     }
 
 
-def refresh_all(force: bool = False) -> pd.DataFrame:
-    """
-    Fetch fundamentals for all symbols (WATCHLIST + ML_EXTRA_TRAINING_SYMBOLS).
+def _load_disclosures() -> dict:
+    if not SEGMENT_DISCLOSURES_PATH.exists():
+        return {}
+    return json.loads(SEGMENT_DISCLOSURES_PATH.read_text(encoding='utf-8'))
 
-    Cache freshness: 24-hour TTL. Pass force=True to override.
-    Returns the cached DataFrame.
-    """
-    # Cache-hit path
+
+def refresh_all(force: bool = False, disclosures: dict | None = None) -> pd.DataFrame:
+    if disclosures is None:
+        disclosures = _load_disclosures()
     if not force and FUNDAMENTALS_CACHE_PATH.exists():
-        age_hours = (datetime.now().timestamp() -
-                     FUNDAMENTALS_CACHE_PATH.stat().st_mtime) / 3600
-        if age_hours < 24:
+        age = (datetime.now().timestamp() - FUNDAMENTALS_CACHE_PATH.stat().st_mtime) / 3600
+        if age < 24:
             cached = pd.read_parquet(FUNDAMENTALS_CACHE_PATH)
-            if len(cached) >= len(_ALL_SYMBOLS) * 0.8:  # 80% coverage acceptable
-                print(f'[fundamentals] Cached (age {age_hours:.1f}h) — '
-                      f'{len(cached)} tickers')
+            if len(cached) >= len(_ALL_SYMBOLS) * 0.8:
+                cached = _merge_disclosures(cached, disclosures)
+                if disclosures:
+                    cached['quality_score'] = cached.apply(_compute_quality_score, axis=1)
                 return cached
-
-    print(f'[fundamentals] Fetching for {len(_ALL_SYMBOLS)} tickers via yfinance...')
-    rows = []
-    for i, ticker in enumerate(_ALL_SYMBOLS, 1):
-        row = _fetch_one_ticker(ticker)
-        rows.append(row)
-        if i % 10 == 0:
-            print(f'  [{i}/{len(_ALL_SYMBOLS)}] fetched')
-
+    rows = [_fetch_one_ticker(t) for t in _ALL_SYMBOLS]
     df = pd.DataFrame(rows).set_index('ticker')
-
-    # Add computed quality score
+    df = _merge_disclosures(df, disclosures)
     df['quality_score'] = df.apply(_compute_quality_score, axis=1)
-
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     df.to_parquet(FUNDAMENTALS_CACHE_PATH)
-    ok_count = int(df['fetch_ok'].sum()) if 'fetch_ok' in df.columns else len(df)
-    print(f'[fundamentals] Cached {len(df)} tickers ({ok_count} with data) -> '
-          f'{FUNDAMENTALS_CACHE_PATH}')
+    return df
+
+
+def _merge_disclosures(df: pd.DataFrame, disclosures: dict | None) -> pd.DataFrame:
+    """Overlay filing/release fields absent from yfinance (e.g. RPO).
+
+    Shape: {'AVGO': {'rpo': 179200, 'rpo_next_12m': 44800,
+                     'rpo_growth': 0.25}}. Amounts use the same currency
+    and scale as total_revenue/free_cashflow (yfinance: usually USD).
+    Update the figures each reporting period; stale contracts are not useful.
+    """
+    if not disclosures:
+        return df
+    allowed = {'rpo', 'rpo_next_12m', 'rpo_growth', 'segments'}
+    df = df.copy()
+    for ticker, fields in disclosures.items():
+        ticker = str(ticker).upper()
+        if ticker not in df.index:
+            continue
+        for key, value in fields.items():
+            if key in allowed:
+                # Store nested segment data as JSON so Parquet has a stable,
+                # portable scalar representation across refreshes.
+                df.loc[ticker, key] = json.dumps(value) if key == 'segments' and isinstance(value, (dict, list)) else (_num(value) if key != 'segments' else value)
     return df
 
 
 def get_ticker(ticker: str, force_refresh: bool = False) -> dict:
-    """
-    Return fundamentals for one ticker, using cache if fresh.
-
-    If ticker not in cache, fetches just that one.
-    """
     ticker = ticker.upper()
-    if force_refresh or not FUNDAMENTALS_CACHE_PATH.exists():
-        refresh_all(force=force_refresh)
-
-    if FUNDAMENTALS_CACHE_PATH.exists():
-        df = pd.read_parquet(FUNDAMENTALS_CACHE_PATH)
-        if ticker in df.index:
-            row = df.loc[ticker].to_dict()
-            row['ticker'] = ticker
-            return row
-
-    # Not in cache — fetch just this one
+    df = refresh_all(force=force_refresh)
+    if ticker in df.index:
+        result = df.loc[ticker].to_dict()
+        result['ticker'] = ticker
+        return result
     row = _fetch_one_ticker(ticker)
+    row = _merge_disclosures(pd.DataFrame([row]).set_index('ticker'),
+                             _load_disclosures()).reset_index().iloc[0].to_dict()
     row['quality_score'] = _compute_quality_score(pd.Series(row))
     return row
 
 
-# ── Quality score computation ────────────────────────────────────────────
+def compute_fair_value(row: pd.Series, margin_of_safety: float = DEFAULT_MARGIN_OF_SAFETY) -> dict:
+    """Return intrinsic-value estimate and a margin-of-safety buy price.
 
-def compute_fair_value(row: pd.Series) -> dict:
+    Company-reported FCF is used as a proxy for FCFF in semi/SaaS DCFs. That
+    proxy is not perfectly unlevered; the EV-to-equity bridge may therefore
+    double count financing effects. Outputs are screening estimates only.
     """
-    Compute a growth-adjusted fair value estimate from reported fundamentals.
-
-    Method (independent of analyst targets):
-      forward_eps         = current_price / forward_pe
-      sustainable_growth  = weighted avg of revenue + earnings growth
-                            (revenue weighted higher — more sustainable)
-      fair_pe             = growth-tier lookup (5-tier ladder)
-      fair_value          = forward_eps * fair_pe
-      discount_to_fair    = (fair_value - price) / price
-
-    Returns dict with all computed values, or None if insufficient data.
-    """
-    fwd_pe = row.get('forward_pe', np.nan)
-    price  = row.get('current_price', np.nan)
-    if pd.isna(fwd_pe) or fwd_pe <= 0 or pd.isna(price) or price <= 0:
-        return {}
-
-    forward_eps = price / fwd_pe
-
-    # Sustainable growth: revenue is more reliable than earnings (which can spike
-    # from one-time gains, tax effects, or coming off a low base). Weight
-    # revenue at 60%, earnings at 40%. Cap at 40% overall — no company
-    # sustains growth above that long enough for a multi-year fair-value.
-    rev_g  = row.get('revenue_growth', np.nan)
-    earn_g = row.get('earnings_growth', np.nan)
-    _CAP = 0.40   # long-term sustainable growth ceiling
-    if not pd.isna(rev_g) and not pd.isna(earn_g):
-        # Cap earnings at 2x revenue (still generous)
-        earn_g_capped = min(earn_g, 2 * abs(rev_g) if rev_g > 0 else 0.30)
-        sustainable_growth = 0.6 * min(rev_g, _CAP) + 0.4 * min(earn_g_capped, _CAP)
-    elif not pd.isna(rev_g):
-        sustainable_growth = min(rev_g, _CAP)
-    elif not pd.isna(earn_g):
-        sustainable_growth = min(earn_g, _CAP)
+    if not 0 <= margin_of_safety < 1:
+        raise ValueError('margin_of_safety must be in [0, 1)')
+    segments = _parse_segments(row.get('segments'))
+    ticker = str(row.get('ticker', getattr(row, 'name', '')) or '').upper()
+    if not segments and ticker in _SEGMENT_REQUIRED:
+        return {'method': 'sum_of_parts',
+                'data_quality': (f'{ticker} reports segments ({_SEGMENT_REQUIRED[ticker]}); '
+                                 f'add them to {SEGMENT_DISCLOSURES_PATH.name} for a sum-of-parts value')}
+    method = 'sum_of_parts' if segments else _pick_method(row)
+    if segments:
+        result = _value_segments(row, segments)
     else:
+        result = _value_dcf(row, method) if method in {'semi', 'saas'} else _value_default(row)
+    if result and np.isfinite(_num(result.get('fair_value'))):
+        result['method'] = method
+        result['margin_of_safety'] = margin_of_safety
+        result['buy_price'] = result['fair_value'] * (1 - margin_of_safety)
+        price = _row_num(row, 'current_price')
+        result['upside_to_fair_value'] = (result['fair_value'] / price - 1) if price > 0 else np.nan
+        result['buy_price_gap'] = (result['buy_price'] / price - 1) if price > 0 else np.nan
+    return result or {}
+
+
+def _parse_segments(value) -> list[dict]:
+    """Read optional segment disclosures; each segment must have its own cash flow."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+    if isinstance(value, dict):
+        value = value.get('segments', [])
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict) and item.get('name')]
+
+
+def _value_segments(row: pd.Series, segments: list[dict]) -> dict:
+    """Sum segment FCFF DCFs, then bridge enterprise value to equity once.
+
+    Segment schema (amounts in the same currency/scale):
+      name, revenue, revenue_growth, fcff; optional EBIT, tax_rate, D&A,
+      capex, change_working_capital, wacc, terminal_growth, forecast_years.
+    FCFF may be supplied directly or derived from EBIT(1-tax)+D&A-capex-ΔWC.
+    Segment EVs are additive only when segment coverage is complete and
+    revenues/cash flows are non-overlapping.
+    """
+    rows = []
+    for segment in segments:
+        name = str(segment['name'])
+        revenue = _num(segment.get('revenue'))
+        growth = _num(segment.get('revenue_growth'))
+        fcff = _num(segment.get('fcff'))
+        if not np.isfinite(fcff):
+            ebit = _num(segment.get('ebit'))
+            tax = _num(segment.get('tax_rate'), 0.21)
+            da = _num(segment.get('da'), 0.0)
+            capex = _num(segment.get('capex'), 0.0)
+            delta_wc = _num(segment.get('change_working_capital'), 0.0)
+            if np.isfinite(ebit):
+                fcff = ebit * (1 - np.clip(tax, 0, 0.60)) + da - capex - delta_wc
+        if not (revenue > 0 and np.isfinite(growth) and np.isfinite(fcff) and fcff > 0):
+            return {'data_quality': f'incomplete segment inputs: {name}', 'segments_valued': len(rows)}
+        wacc = _num(segment.get('wacc'), 0.10)
+        terminal_growth = _num(segment.get('terminal_growth'), 0.025)
+        years = int(_num(segment.get('forecast_years'), 5))
+        if years < 2 or wacc <= terminal_growth or terminal_growth < -0.02 or wacc > 0.30:
+            return {'data_quality': f'invalid DCF parameters: {name}', 'segments_valued': len(rows)}
+        margin = fcff / revenue
+        growth_end = _num(segment.get('terminal_revenue_growth'), terminal_growth)
+        growth_start = float(np.clip(growth, -0.30, 0.50))
+        growth_end = float(np.clip(growth_end, -0.05, 0.08))
+        pv = 0.0
+        revenue_y, fcff_y = revenue, fcff
+        for year in range(1, years + 1):
+            g = growth_start + (growth_end - growth_start) * (year - 1) / (years - 1)
+            revenue_y *= 1 + g
+            fcff_y = revenue_y * margin
+            pv += fcff_y / (1 + wacc) ** year
+        terminal_value = fcff_y * (1 + terminal_growth) / (wacc - terminal_growth)
+        ev = pv + terminal_value / (1 + wacc) ** years
+        rows.append({'name': name, 'revenue': revenue, 'fcff': fcff,
+                     'growth_start': growth_start, 'growth_end': growth_end,
+                     'wacc': wacc, 'terminal_growth': terminal_growth,
+                     'enterprise_value': float(ev)})
+    total_revenue = sum(x['revenue'] for x in rows)
+    reported_revenue = _row_num(row, 'total_revenue')
+    coverage = total_revenue / reported_revenue if reported_revenue > 0 else np.nan
+    # Segment cash flows are FCFF, so financing claims are bridged once here.
+    equity = sum(x['enterprise_value'] for x in rows) - max(0, _row_num(row, 'total_debt', 0)) + max(0, _row_num(row, 'total_cash', 0))
+    shares = _row_num(row, 'shares_outstanding')
+    price = _row_num(row, 'current_price')
+    if not (shares > 0 and equity > 0):
+        return {'data_quality': 'missing shares or non-positive equity value', 'segments': rows,
+                'segment_revenue_coverage': coverage}
+    fair_value = equity / shares
+    if price > 0 and fair_value > price * 5:
+        return {'data_quality': 'implausible output; review segment inputs', 'segments': rows,
+                'segment_revenue_coverage': coverage}
+    coverage_note = ('segment revenue coverage below 90%; likely incomplete segment disclosures'
+                     if np.isfinite(coverage) and coverage < 0.90 else
+                     'segment revenue coverage exceeds reported company revenue; check overlap/units'
+                     if np.isfinite(coverage) and coverage > 1.10 else
+                     'segment revenue coverage consistent with reported revenue'
+                     if np.isfinite(coverage) else 'company revenue unavailable; coverage not assessed')
+    return {'fair_value': float(fair_value), 'enterprise_value': float(sum(x['enterprise_value'] for x in rows)),
+            'equity_value': float(equity), 'segments': rows, 'segments_valued': len(rows),
+            'segment_revenue_coverage': coverage,
+            'data_quality': f'segment FCFF DCF; {coverage_note}; verify currency and non-overlap'}
+
+
+def _pick_method(row: pd.Series) -> str:
+    industry = str(row.get('industry', '') or '').lower()
+    ticker = str(row.get('ticker', getattr(row, 'name', '')) or '').upper()
+    if 'semiconductor' in industry or ticker in _MEMORY_TICKERS:
+        return 'semi'
+    if ticker in {'NET', 'DDOG', 'CRWD', 'PANW', 'SNOW', 'MDB', 'CRM', 'NOW'}:
+        return 'saas'
+    return 'default'
+
+
+def _value_dcf(row: pd.Series, method: str) -> dict:
+    """Two-stage FCFF-proxy DCF with conservative guards and visible inputs."""
+    revenue = _row_num(row, 'total_revenue')
+    fcf = _row_num(row, 'free_cashflow')
+    growth = _row_num(row, 'revenue_growth')
+    price = _row_num(row, 'current_price')
+    shares = _row_num(row, 'shares_outstanding')
+    debt = max(0.0, _row_num(row, 'total_debt', 0.0))
+    cash = max(0.0, _row_num(row, 'total_cash', 0.0))
+    if not (revenue > 0 and fcf > 0 and shares > 0 and price > 0):
+        return {}
+    historical_median = _row_num(row, 'historical_revenue_growth_median')
+    historical_vol = _row_num(row, 'historical_revenue_growth_volatility')
+    if not np.isfinite(growth) and not np.isfinite(historical_median):
         return {}
 
-    # Base fair PE ladder from sustainable growth tier
-    if   sustainable_growth > 0.30: base_pe = 35    # hyper-growth premium
-    elif sustainable_growth > 0.15: base_pe = 25    # strong growth
-    elif sustainable_growth > 0.05: base_pe = 18    # mature
-    elif sustainable_growth > 0:    base_pe = 12    # slow
-    else:                            base_pe = 8    # declining
+    # Historical growth level sets the year-5 anchor. Recent growth informs
+    # year 1; historical volatility is used to cap the plausible range, not as
+    # a growth rate. This avoids a universal 5% year-5 assumption.
+    if not np.isfinite(historical_median):
+        historical_median = growth
+    if not np.isfinite(growth):
+        growth = historical_median
+    growth_end = float(np.clip(historical_median, -0.20, 0.40))
+    growth_start = 0.40 * growth + 0.60 * historical_median
 
-    # Quality premium: high-ROE businesses compound capital and earn premium multiples
-    roe = row.get('roe', np.nan)
-    if pd.isna(roe):     roe_mult = 1.00
-    elif roe > 0.50:     roe_mult = 1.30
-    elif roe > 0.30:     roe_mult = 1.20
-    elif roe > 0.20:     roe_mult = 1.10
-    elif roe > 0.10:     roe_mult = 1.00
-    else:                roe_mult = 0.90
-    fair_pe = base_pe * roe_mult
+    # Optional RPO/bookings signal. It nudges the near-term growth anchor only
+    # when the comparable RPO growth rate is supplied; absolute RPO is not
+    # added to revenue, because contracted revenue is already in the base.
+    rpo_growth = _row_num(row, 'rpo_growth')
+    rpo_adjustment = float(np.clip(0.10 * rpo_growth, -0.05, 0.05)) if np.isfinite(rpo_growth) else 0.0
+    growth_start += rpo_adjustment
 
-    # Cyclical cap: commodity-like businesses (memory, storage, energy, materials)
-    # never get growth multiples at earnings peaks — the market prices mean
-    # reversion. When forward PE is very low relative to the growth rate, that
-    # is the market signaling "peak earnings", not "undervalued".
-    industry = str(row.get('industry', '') or '').lower()
-    sector   = str(row.get('sector', '') or '').lower()
-    cyclical_kw = ('memory', 'storage', 'oil', 'gas', 'steel', 'mining', 'chemicals')
-    is_cyclical = any(k in industry for k in cyclical_kw) or ticker_is_memory(row)
-    cyclical_note = ''
-    if is_cyclical:
-        fair_pe = min(fair_pe, 15)
-        cyclical_note = 'cyclical cap 15x'
-    # Peak-earnings detector for any sector: tiny forward PE + huge growth
-    # means consensus EPS is at a cyclical high; anchor to current PE instead.
-    if fwd_pe < 10 and sustainable_growth >= 0.30:
-        fair_pe = min(fair_pe, max(fwd_pe * 1.5, 10))
-        cyclical_note = 'peak-earnings anchor'
+    # Keep the near-term estimate within one historical standard deviation
+    # of the historical median where enough annual observations exist.
+    if np.isfinite(historical_vol) and historical_vol > 0:
+        growth_start = float(np.clip(growth_start, historical_median - historical_vol,
+                                     historical_median + historical_vol))
+    growth_start = float(np.clip(growth_start, -0.20, 0.40))
+    if method == 'semi':
+        wacc, terminal_growth, horizon = 0.10, 0.025, 5
+        segment = _semi_segment(row)
+        # Memory is more cyclical. Discount current FCF when forward earnings
+        # imply a peak; do not increase FCF for a perceived trough.
+        fwd_pe = _row_num(row, 'forward_pe')
+        cycle_factor = 0.70 if segment == 'memory' and 0 < fwd_pe < 10 else 1.0
+        method_detail = f'{segment}; reported FCF proxy; cycle factor {cycle_factor:.2f}'
+    else:
+        wacc, terminal_growth, horizon = 0.10, 0.025, 5
+        cycle_factor = 1.0
+        method_detail = 'SaaS; reported FCF margin held/improved gradually, capped at 30%'
 
-    fair_value = forward_eps * fair_pe
-    discount_to_fair = (fair_value - price) / price   # positive = undervalued
+    fcf_margin = fcf / revenue
+    if method == 'saas':
+        # Avoid assuming an extreme turnaround: negative/very low FCF is not
+        # valued by this route; positive margins converge at most to 30%.
+        target_margin = max(fcf_margin, 0.20)
+        target_margin = min(target_margin, 0.30)
+        margin_start = fcf_margin
+    else:
+        margin_start = fcf_margin
+        target_margin = fcf_margin
 
+    fcf_base = fcf * cycle_factor
+    pv = 0.0
+    revenue_y = revenue
+    fcf_y = fcf_base
+    for year in range(1, horizon + 1):
+        g = growth_start + (growth_end - growth_start) * (year - 1) / (horizon - 1)
+        revenue_y *= (1 + g)
+        margin_y = margin_start + (target_margin - margin_start) * year / horizon
+        fcf_y = revenue_y * margin_y * cycle_factor
+        pv += fcf_y / (1 + wacc) ** year
+    tv = fcf_y * (1 + terminal_growth) / (wacc - terminal_growth)
+    enterprise_value = pv + tv / (1 + wacc) ** horizon
+    equity_value = enterprise_value - debt + cash
+    fair_value = equity_value / shares
+    if not np.isfinite(fair_value) or fair_value <= 0 or fair_value > price * 5:
+        return {}
     return {
-        'forward_eps':        forward_eps,
-        'sustainable_growth': sustainable_growth,
-        'base_pe':            base_pe,
-        'roe_mult':           roe_mult,
-        'fair_pe':            round(fair_pe, 1),
-        'cyclical_note':      cyclical_note,
-        'fair_value':         fair_value,
-        'discount_to_fair':   discount_to_fair,
+        'fair_value': float(fair_value), 'discount_to_fair': float(fair_value / price - 1),
+        'enterprise_value': float(enterprise_value), 'equity_value': float(equity_value),
+        'fcf_margin': float(fcf_margin), 'growth_start': growth_start,
+        'growth_end': growth_end, 'wacc': wacc, 'terminal_growth': terminal_growth,
+        'historical_growth_median': historical_median,
+        'historical_growth_volatility': historical_vol,
+        'rpo_growth_adjustment': rpo_adjustment,
+        'rpo': _row_num(row, 'rpo'), 'rpo_next_12m': _row_num(row, 'rpo_next_12m'),
+        'rpo_12m_coverage': (_row_num(row, 'rpo_next_12m') / revenue
+                             if np.isfinite(_row_num(row, 'rpo_next_12m')) and revenue > 0 else np.nan),
+        'method_detail': method_detail,
+        'data_quality': 'proxy: company-reported FCF may not equal unlevered FCFF',
     }
 
 
-_MEMORY_TICKERS = {'MU', 'WDC', 'STX', 'SNDK'}
+def _semi_segment(row):
+    ticker = str(row.get('ticker', getattr(row, 'name', '')) or '').upper()
+    industry = str(row.get('industry', '') or '').lower()
+    if ticker in _MEMORY_TICKERS or 'memory' in industry:
+        return 'memory'
+    if ticker in {'ASML', 'AMAT', 'LRCX', 'KLAC'} or 'equipment' in industry:
+        return 'equipment'
+    if ticker == 'TSM':
+        return 'foundry'
+    return 'design/logic'
+
+
+def _value_default(row: pd.Series) -> dict:
+    """Simple growth-tier P/E screen for companies outside the focus sectors."""
+    fwd_pe = _row_num(row, 'forward_pe')
+    price = _row_num(row, 'current_price')
+    if not (fwd_pe > 0 and price > 0):
+        return {}
+    rev_g = _row_num(row, 'revenue_growth')
+    earn_g = _row_num(row, 'earnings_growth')
+    growths = [x for x in (rev_g, earn_g) if np.isfinite(x)]
+    if not growths:
+        return {}
+    growth = float(np.clip(np.mean(growths), -0.30, 0.40))
+    base_pe = 35 if growth > .30 else 25 if growth > .15 else 18 if growth > .05 else 12 if growth > 0 else 8
+    roe = _row_num(row, 'roe')
+    roe_mult = 1.20 if roe > .30 else 1.10 if roe > .20 else 1.0 if roe > .10 else .90
+    fair_value = (price / fwd_pe) * base_pe * roe_mult
+    return {'fair_value': float(fair_value), 'discount_to_fair': float(fair_value / price - 1),
+            'method_detail': 'growth-tier P/E screen; lower confidence than sector DCF'}
 
 
 def ticker_is_memory(row) -> bool:
-    t = row.get('ticker') if hasattr(row, 'get') else None
-    if t is None and hasattr(row, 'name'):
-        t = row.name
-    return str(t).upper() in _MEMORY_TICKERS
+    return str(row.get('ticker', getattr(row, 'name', '')) or '').upper() in _MEMORY_TICKERS
 
 
 def _compute_quality_score(row: pd.Series) -> float:
-    """
-    Aggregate fundamentals into a 0-100 quality score.
-
-    Emphasizes HARD FINANCIALS reported in earnings filings; de-weights
-    analyst opinions (targets are unreliable and often lagging).
-
-    Breakdown (max points):
-      Growth        25   (revenue + earnings YoY, from reported 10-Q/10-K)
-      Valuation     25   (forward PE + PEG + P/S — mathematical, based on filings)
-      Profitability 25   (ROE + profit margin + operating margin — reported)
-      Balance sheet 15   (debt/equity + FCF — reported)
-      Analyst rec   10   (buy/hold/sell only — NO target price)
-
-    Extension penalty: if analyst target ≤ current price (analysts see no
-    upside), score is capped at 65 (DECENT tier) regardless of underlying
-    strength — the market has already priced in the fundamentals.
-
-    Missing values contribute 0 to their category (not penalized).
-    """
+    """Legacy screening score retained for compatibility; not a buy-price input."""
     if not row.get('fetch_ok', True):
         return np.nan
-
     score = 0.0
-
-    # ── Growth (25 pts, from reported filings) ────────────────────────────
-    rev_growth = row.get('revenue_growth', np.nan)
-    if not pd.isna(rev_growth):
-        if   rev_growth > 0.30: score += 15    # top-tier growth
-        elif rev_growth > 0.15: score += 10
-        elif rev_growth > 0.05: score += 5
-    earn_growth = row.get('earnings_growth', np.nan)
-    if not pd.isna(earn_growth):
-        if   earn_growth > 0.20: score += 10
-        elif earn_growth > 0.05: score += 5
-
-    # ── Valuation (25 pts, mathematical from reported earnings) ───────────
-    fwd_pe = row.get('forward_pe', np.nan)
-    if not pd.isna(fwd_pe) and fwd_pe > 0:
-        if   fwd_pe < 15: score += 12
-        elif fwd_pe < 25: score += 8
-        elif fwd_pe < 40: score += 4
-    trailing_pe = row.get('trailing_pe', np.nan)
-    if not pd.isna(trailing_pe) and trailing_pe > 0:
-        # Trailing PE cross-check — punish if wildly higher than forward
-        # (indicates earnings deteriorating fast)
-        if not pd.isna(fwd_pe) and trailing_pe > fwd_pe * 2.5:
-            score -= 3
-    peg = row.get('peg_ratio', np.nan)
-    if not pd.isna(peg) and peg > 0:
-        if   peg < 1:  score += 8       # cheap for growth
-        elif peg < 2:  score += 3
-        elif peg > 3:  score -= 3       # expensive for growth
-    ps = row.get('price_to_sales', np.nan)
-    if not pd.isna(ps) and ps > 0 and ps < 5:
-        score += 5   # reasonable P/S ratio bonus
-    score = max(0, score)   # never negative from valuation alone
-
-    # ── Profitability (25 pts, from reported financials) ─────────────────
-    roe = row.get('roe', np.nan)
-    if not pd.isna(roe):
-        if   roe > 0.30: score += 12   # exceptional (NVDA, TSM territory)
-        elif roe > 0.20: score += 9
-        elif roe > 0.12: score += 5
-        elif roe > 0.05: score += 2
-    pm = row.get('profit_margin', np.nan)
-    if not pd.isna(pm):
-        if   pm > 0.25: score += 8
-        elif pm > 0.15: score += 5
-        elif pm > 0.05: score += 2
-    # Operating margin (if available in row — extend to fetch later)
-    om = row.get('operating_margin', np.nan)
-    if not pd.isna(om):
-        if om > 0.20: score += 5
-        elif om > 0.10: score += 2
-
-    # ── Balance sheet (15 pts) ───────────────────────────────────────────
-    de = row.get('debt_to_equity', np.nan)
-    if not pd.isna(de):
-        if de > 5: de = de / 100   # yfinance sometimes reports as percent
-        if   de < 0.5: score += 10
-        elif de < 1.0: score += 7
-        elif de < 2.0: score += 3
-    fcf = row.get('free_cashflow', np.nan)
-    if not pd.isna(fcf) and fcf > 0:
-        score += 5
-
-    # ── Analyst recommendation only (10 pts — target price ignored) ──────
-    # Analyst rec is a consensus of many analysts, generally more reliable
-    # than any single target price. We take the buy/hold/sell signal but
-    # NOT the target upside (targets are often revised after the move).
-    rec = row.get('analyst_rec_mean', np.nan)
-    if not pd.isna(rec):
-        if   rec < 1.5: score += 10      # strong buy consensus
-        elif rec < 2.0: score += 7       # buy
-        elif rec < 2.5: score += 3       # hold-buy
-
-    raw_score = min(100, max(0, round(score, 1)))
-
-    # ── Fair-value check (independent of analysts, derived from growth) ──
-    # Compute what the stock SHOULD be worth given its growth rate, and
-    # compare to current price. This is a stronger signal than analyst
-    # target because it's derived directly from reported financials.
+    rev = _row_num(row, 'revenue_growth')
+    earn = _row_num(row, 'earnings_growth')
+    if np.isfinite(rev): score += 15 if rev > .30 else 10 if rev > .15 else 5 if rev > .05 else 0
+    if np.isfinite(earn): score += 10 if earn > .20 else 5 if earn > .05 else 0
+    pe = _row_num(row, 'forward_pe')
+    if pe > 0: score += 12 if pe < 15 else 8 if pe < 25 else 4 if pe < 40 else 0
+    peg = _row_num(row, 'peg_ratio')
+    if peg > 0: score += 8 if peg < 1 else 3 if peg < 2 else -3 if peg > 3 else 0
+    roe = _row_num(row, 'roe')
+    pm = _row_num(row, 'profit_margin')
+    om = _row_num(row, 'operating_margin')
+    if np.isfinite(roe): score += 12 if roe > .30 else 9 if roe > .20 else 5 if roe > .12 else 2 if roe > .05 else 0
+    if np.isfinite(pm): score += 8 if pm > .25 else 5 if pm > .15 else 2 if pm > .05 else 0
+    if np.isfinite(om): score += 5 if om > .20 else 2 if om > .10 else 0
+    de = _row_num(row, 'debt_to_equity')
+    if np.isfinite(de):
+        de = de / 100 if de > 5 else de
+        score += 10 if de < .5 else 7 if de < 1 else 3 if de < 2 else 0
+    if _row_num(row, 'free_cashflow') > 0: score += 5
+    rec = _row_num(row, 'analyst_rec_mean')
+    if np.isfinite(rec): score += 10 if rec < 1.5 else 7 if rec < 2 else 3 if rec < 2.5 else 0
     fv = compute_fair_value(row)
     if fv:
-        discount = fv['discount_to_fair']    # positive = undervalued
-        if   discount > 0.20:  raw_score += 5    # deeply undervalued (>20% discount)
-        elif discount > 0.05:  raw_score += 3    # undervalued (5-20% discount)
-        elif discount < -0.30: raw_score -= 10   # deeply overvalued
-        elif discount < -0.15: raw_score -= 5    # overvalued
-        # Hard cap when significantly overvalued
-        if discount < -0.20: raw_score = min(raw_score, 60)  # DECENT max
-        if discount < -0.35: raw_score = min(raw_score, 40)  # WEAK max
-
-    # ── Analyst-target cross-check (secondary signal) ────────────────────
-    # Use analyst target ONLY as a sanity check on the fair-value calc.
-    target = row.get('analyst_target', np.nan)
-    price  = row.get('current_price', np.nan)
-    if not pd.isna(target) and not pd.isna(price) and price > 0:
-        upside = target / price - 1
-        # Only apply extension cap if BOTH signals agree it's overvalued
-        if upside <= 0.00 and fv and fv.get('discount_to_fair', 0) < 0:
-            raw_score = min(raw_score, 65)   # capped at DECENT
-
-    return min(100, max(0, round(raw_score, 1)))
-
-
-# ── Verdict label ────────────────────────────────────────────────────────
-
-def leaderboard(filter_mode: str = 'all') -> pd.DataFrame:
-    """
-    Print a sorted leaderboard of all tickers by fundamental quality score.
-
-    filter_mode:
-      'all'          — every ticker
-      'strong'       — quality score >= 70 only
-      'quality-dips' — quality >= 70 AND technical signal weak (advisor SKIP)
-                       These are watchlist-priority: quality names at oversold levels.
-
-    Returns the leaderboard DataFrame (also prints).
-    """
-    df = refresh_all(force=False)
-    if 'fetch_ok' in df.columns:
-        df = df[df['fetch_ok'] == True]
-
-    # Filter
-    if filter_mode == 'strong':
-        df = df[df['quality_score'] >= 70]
-    elif filter_mode == 'quality-dips':
-        # Needs technical context — compute in caller or delegate
-        df = df[df['quality_score'] >= 70]  # start with strong, filter for dips downstream
-
-    df = df.sort_values('quality_score', ascending=False)
-
-    print(f'\n{"="*94}')
-    print(f'  FUNDAMENTALS LEADERBOARD — {len(df)} tickers  (filter: {filter_mode})')
-    print(f'{"="*94}')
-    header = (f'  {"#":<3} {"Ticker":<6} {"Score":>5} {"Rev%":>7} {"Earn%":>7} '
-              f'{"FwdPE":>6} {"PEG":>5} {"ROE":>7} {"FairVal":>8} {"vs Fair":>8} {"Rec":>5} {"Verdict":>9}')
-    print(header)
-    print(f'  {"-"*92}')
-    for i, (ticker, r) in enumerate(df.iterrows(), 1):
-        emoji, verdict, _ = quality_label(r['quality_score'])
-        rev  = f'{r["revenue_growth"]*100:+6.1f}%' if not pd.isna(r["revenue_growth"]) else '   N/A'
-        earn = f'{r["earnings_growth"]*100:+6.1f}%' if not pd.isna(r["earnings_growth"]) else '   N/A'
-        pe   = f'{r["forward_pe"]:>5.1f}' if not pd.isna(r["forward_pe"]) else '  N/A'
-        peg  = f'{r["peg_ratio"]:>4.2f}' if not pd.isna(r["peg_ratio"]) else ' N/A'
-        roe  = f'{r["roe"]*100:+6.1f}%' if not pd.isna(r["roe"]) else '   N/A'
-        rec  = f'{r["analyst_rec_mean"]:>4.2f}' if not pd.isna(r["analyst_rec_mean"]) else ' N/A'
-        # Fair value from growth-adjusted computation
-        fv = compute_fair_value(r)
-        fair_val_str = f'${fv["fair_value"]:>6.0f}' if fv else '     N/A'
-        vs_fair_str  = f'{fv["discount_to_fair"]*100:+6.1f}%' if fv else '     N/A'
-        print(f'  {i:<3} {ticker:<6} {r["quality_score"]:>4.0f}  {rev} {earn} '
-              f'{pe} {peg} {roe} {fair_val_str} {vs_fair_str}  {rec}  {emoji} {verdict}')
-
-    return df
+        d = fv.get('discount_to_fair', 0)
+        score += 5 if d > .20 else 3 if d > .05 else -10 if d < -.30 else -5 if d < -.15 else 0
+    return float(np.clip(round(score, 1), 0, 100))
 
 
 def quality_label(score: float) -> tuple:
-    """
-    Convert a quality score into (emoji, verdict, description).
-    """
-    if pd.isna(score):
-        return ('⚪', 'UNKNOWN', 'fundamentals data unavailable')
-    if score >= 70:
-        return ('🟢', 'STRONG',
-                 'high-quality name — growth + profitability + analyst confidence')
-    if score >= 50:
-        return ('🟡', 'DECENT',
-                 'mixed quality — some strong metrics, some weak')
-    if score >= 30:
-        return ('🟠', 'WEAK',
-                 'below-average fundamentals — trade with caution')
-    return ('🔴', 'POOR',
-             'weak fundamentals — likely a low-quality or distressed name')
+    if pd.isna(score): return ('⚪', 'UNKNOWN', 'fundamentals data unavailable')
+    if score >= 70: return ('🟢', 'STRONG', 'higher screening score')
+    if score >= 50: return ('🟡', 'DECENT', 'mixed screening results')
+    if score >= 30: return ('🟠', 'WEAK', 'weaker screening results')
+    return ('🔴', 'POOR', 'low screening score')
+
+
+def leaderboard(filter_mode: str = 'all') -> pd.DataFrame:
+    df = refresh_all()
+    if 'fetch_ok' in df: df = df[df['fetch_ok'] == True]
+    if filter_mode == 'strong': df = df[df['quality_score'] >= 70]
+    df = df.sort_values('quality_score', ascending=False)
+    for ticker, row in df.iterrows():
+        fv = compute_fair_value(row)
+        print(f"{ticker:<6} score={row.get('quality_score', np.nan):>5}  "
+              f"price={_row_num(row, 'current_price'):>8.2f}  "
+              f"fair={fv.get('fair_value', np.nan):>8.2f}  "
+              f"buy@25%MoS={fv.get('buy_price', np.nan):>8.2f}  "
+              f"{fv.get('method_detail', 'N/A')}")
+    return df

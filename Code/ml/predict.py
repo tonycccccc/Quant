@@ -54,7 +54,6 @@ def predict_success_prob(feature_row: dict) -> float:
         return 0.5
 
     try:
-        import numpy as np
         import pandas as pd
 
         # Use the bundle's own feature_cols — this is the subset the model

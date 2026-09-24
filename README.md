@@ -1,21 +1,26 @@
-# Phase 0 — no API keys needed
-python Code/main.py phase0 --dry-run
+# RATMB — momentum model + fundamentals advisor
 
-# Phase 0 — live (needs ANTHROPIC_API_KEY + PERPLEXITY_API_KEY in .env)
-python Code/main.py phase0
+Captures momentum breakouts in US tech stocks (rule score + LightGBM gate on
+30-min Alpaca bars) and adds a fundamentals layer that estimates fair value
+and a margin-of-safety buy price. Advisory only: no orders are placed.
 
-# Phase 1 — uses real Alpaca historical data, skips market-hours check
-python Code/main.py phase1 --test --dry-run
+```
+# Once per trading day (pre-market): new bars, features, fundamentals, retrain if stale
+python Code/main.py daily-update
 
-# Phase 2 — injects a real-data signal for any ticker (dry-run by default)
-python Code/main.py phase2 --ticker NVDA
-python Code/main.py phase2 --ticker TSLA --live   # submits real paper order
+# Which tickers have a momentum setup right now?
+python Code/main.py scan-momentum --only-buys
 
-# Phase 3 — starts the WebSocket listener (blocks until Ctrl+C)
-python Code/main.py phase3
+# Full report for one ticker: signal, entry/TP/SL plan, sizing, fair value
+python Code/main.py advise --ticker NVDA --equity 25000
 
-# Portfolio status
-python Code/main.py status
+# Fundamentals leaderboard
+python Code/main.py scan-fundamentals
+```
 
-# Full pipeline
-python Code/main.py run --test --dry-run
+Model maintenance: `build-dataset`, `train-model`, `backtest`, `oos-backtest`,
+`walk-forward-oos`, `tune-bracket`, `ablate-features` (see `python Code/main.py -h`).
+
+Setup: `pip install -r requirements.txt`, then put `ALPACA_API_KEY` and
+`ALPACA_SECRET_KEY` in `.env`. Segment data for multi-segment companies
+(e.g. MSFT) goes in `Code/ml/segment_disclosures.json`.

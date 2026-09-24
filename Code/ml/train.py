@@ -35,7 +35,7 @@ from config import (
     ML_CALIBRATION_METHOD, ML_CALIBRATION_CV,
     ML_CONFIDENCE_THRESHOLD, ML_SAMPLE_WEIGHTS_ENABLED,
 )
-from ml.features import FEATURE_COLS, ML_TRAINING_FEATURES, compute_signal_score_col
+from ml.features import ML_TRAINING_FEATURES, compute_signal_score_col
 
 # The ML model trains on ML_TRAINING_FEATURES (10) — the ablation-validated
 # subset. FEATURE_COLS (40) stays for logging/alert/backtest visibility.

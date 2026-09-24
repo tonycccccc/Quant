@@ -132,6 +132,19 @@ def fetch_bars(months_back: int = ML_HISTORY_MONTHS, force: bool = False):
     return df
 
 
+def fetch_recent(days_back: int = 90):
+    """Live fetch of the full universe, uncached. Same shape as raw_bars.parquet."""
+    from alpaca.data.historical import StockHistoricalDataClient
+
+    all_trade_symbols = list(WATCHLIST.keys())
+    extra = [s for s in ML_EXTRA_TRAINING_SYMBOLS if s not in all_trade_symbols]
+    symbols = all_trade_symbols + extra + _INDEX_TICKERS
+    end = datetime.now()
+    client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    bars = _fetch_chunk(client, symbols, end - timedelta(days=days_back), end, 1, 1)
+    return bars[[c for c in ['open', 'high', 'low', 'close', 'volume'] if c in bars.columns]]
+
+
 def fetch_incremental(lookback_days: int = 2):
     """
     Incremental fetch: appends bars from (last_cached_ts - lookback_days) to now.

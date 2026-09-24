@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from config import (
     LOGS_DIR, ML_FEATURES_PATH, ML_RAW_BARS_PATH,
     SIGNAL_BUY_THRESHOLD, RISK_PER_TRADE, MAX_STOCK_CONCENTRATION,
-    HARD_STOP_LOSS_PCT, WATCHLIST,
+    WATCHLIST,
 )
 
 

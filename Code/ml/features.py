@@ -26,7 +26,7 @@ from config import (
     VOLUME_MA_PERIOD, RESISTANCE_LOOKBACK, VWAP_HOLD_BARS,
     RSI_PERIOD, MACD_FAST_PERIOD, MACD_SLOW_PERIOD, MACD_SIGNAL_PERIOD,
     ML_FEATURES_PATH, ML_RAW_BARS_PATH, MODELS_DIR,
-    WATCHLIST, ML_EXTRA_TRAINING_SYMBOLS,
+    WATCHLIST,
 )
 
 # ── ML TRAINING SUBSET (ablation-validated winner — 10 features) ─────────
@@ -823,9 +823,7 @@ def indicators_to_feature_row(
         'd_atr_pct':           d_atr_pct_val,
         'd_vol_ratio':         d_vol_ratio_val,
         'd_return_20d':        d_return_20d_val,
-        # Cross-sectional ranks — default to 0.5 (neutral) at inference time.
-        # In a multi-stock polling cycle, callers can fill these by ranking
-        # this bar's value vs all other stocks in the same cycle.
+        # Cross-sectional ranks — injected by advisor.compute_ranks; 0.5 if absent.
         'rs_rank_5d':         float(indicators.get('rs_rank_5d',        0.5)),
         'rsi_rank':           float(indicators.get('rsi_rank',          0.5)),
         'momentum_rank_20d':  float(indicators.get('momentum_rank_20d', 0.5)),
@@ -837,9 +835,7 @@ def indicators_to_feature_row(
         # the spy_ema_aligned / qqq_ema_aligned features.
         'primary_score':      float(indicators.get('primary_base_score',
                                                     indicators.get('signal_score', 0.0))),
-        # Macro / options-adjacent features — caller injects via indicators dict.
-        # See phase1_polling: get_latest_macro() from ml.macro_features runs once
-        # per polling cycle and injects these into every ticker's indicators.
+        # Macro features — injected by advisor.evaluate from get_latest_macro().
         'vix_9d':             float(indicators.get('vix_9d',         20.0)),
         'vix_3m':             float(indicators.get('vix_3m',         22.0)),
         'vix_term_ratio':     float(indicators.get('vix_term_ratio', 1.0)),
