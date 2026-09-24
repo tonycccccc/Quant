@@ -76,6 +76,7 @@ def _fetch_one_ticker(ticker: str) -> dict:
         'fetched_at':         datetime.now().isoformat(),
         'fetch_ok':           True,
         'sector':             info.get('sector', ''),
+        'industry':           info.get('industry', ''),
         'market_cap':         _get('marketCap'),
         'current_price':      _get('currentPrice') or _get('regularMarketPrice'),
         # Valuation
@@ -208,12 +209,40 @@ def compute_fair_value(row: pd.Series) -> dict:
     else:
         return {}
 
-    # Fair PE ladder based on sustainable growth tier
-    if   sustainable_growth > 0.30: fair_pe = 35    # hyper-growth premium
-    elif sustainable_growth > 0.15: fair_pe = 25    # strong growth
-    elif sustainable_growth > 0.05: fair_pe = 18    # mature
-    elif sustainable_growth > 0:    fair_pe = 12    # slow
-    else:                            fair_pe = 8    # declining
+    # Base fair PE ladder from sustainable growth tier
+    if   sustainable_growth > 0.30: base_pe = 35    # hyper-growth premium
+    elif sustainable_growth > 0.15: base_pe = 25    # strong growth
+    elif sustainable_growth > 0.05: base_pe = 18    # mature
+    elif sustainable_growth > 0:    base_pe = 12    # slow
+    else:                            base_pe = 8    # declining
+
+    # Quality premium: high-ROE businesses compound capital and earn premium multiples
+    roe = row.get('roe', np.nan)
+    if pd.isna(roe):     roe_mult = 1.00
+    elif roe > 0.50:     roe_mult = 1.30
+    elif roe > 0.30:     roe_mult = 1.20
+    elif roe > 0.20:     roe_mult = 1.10
+    elif roe > 0.10:     roe_mult = 1.00
+    else:                roe_mult = 0.90
+    fair_pe = base_pe * roe_mult
+
+    # Cyclical cap: commodity-like businesses (memory, storage, energy, materials)
+    # never get growth multiples at earnings peaks — the market prices mean
+    # reversion. When forward PE is very low relative to the growth rate, that
+    # is the market signaling "peak earnings", not "undervalued".
+    industry = str(row.get('industry', '') or '').lower()
+    sector   = str(row.get('sector', '') or '').lower()
+    cyclical_kw = ('memory', 'storage', 'oil', 'gas', 'steel', 'mining', 'chemicals')
+    is_cyclical = any(k in industry for k in cyclical_kw) or ticker_is_memory(row)
+    cyclical_note = ''
+    if is_cyclical:
+        fair_pe = min(fair_pe, 15)
+        cyclical_note = 'cyclical cap 15x'
+    # Peak-earnings detector for any sector: tiny forward PE + huge growth
+    # means consensus EPS is at a cyclical high; anchor to current PE instead.
+    if fwd_pe < 10 and sustainable_growth >= 0.30:
+        fair_pe = min(fair_pe, max(fwd_pe * 1.5, 10))
+        cyclical_note = 'peak-earnings anchor'
 
     fair_value = forward_eps * fair_pe
     discount_to_fair = (fair_value - price) / price   # positive = undervalued
@@ -221,10 +250,23 @@ def compute_fair_value(row: pd.Series) -> dict:
     return {
         'forward_eps':        forward_eps,
         'sustainable_growth': sustainable_growth,
-        'fair_pe':            fair_pe,
+        'base_pe':            base_pe,
+        'roe_mult':           roe_mult,
+        'fair_pe':            round(fair_pe, 1),
+        'cyclical_note':      cyclical_note,
         'fair_value':         fair_value,
         'discount_to_fair':   discount_to_fair,
     }
+
+
+_MEMORY_TICKERS = {'MU', 'WDC', 'STX', 'SNDK'}
+
+
+def ticker_is_memory(row) -> bool:
+    t = row.get('ticker') if hasattr(row, 'get') else None
+    if t is None and hasattr(row, 'name'):
+        t = row.name
+    return str(t).upper() in _MEMORY_TICKERS
 
 
 def _compute_quality_score(row: pd.Series) -> float:

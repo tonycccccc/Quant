@@ -419,7 +419,10 @@ def _print_report(r: dict, indicators: dict, bundle_info, verbose: bool = False)
                           else 'mature' if fv['sustainable_growth'] > 0.05
                           else 'slow' if fv['sustainable_growth'] > 0
                           else 'declining')
-                print(f'      Fair PE for tier:   {fv["fair_pe"]}x  ({tier})')
+                adj = f'base {fv["base_pe"]}x ({tier}) × ROE {fv["roe_mult"]:.2f}'
+                if fv.get('cyclical_note'):
+                    adj += f', {fv["cyclical_note"]}'
+                print(f'      Fair PE:            {fv["fair_pe"]}x  ({adj})')
                 print(f'      Fair value:         ${fv["fair_value"]:.2f}')
                 disc = fv["discount_to_fair"]
                 verdict_price = ('🟢 UNDERVALUED' if disc > 0.10
