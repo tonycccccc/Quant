@@ -286,9 +286,10 @@ def compute_recommended_threshold(
     X: pd.DataFrame,
     y: pd.Series,
     target_precision: float = 0.50,
+    feature_cols: list = None,
 ) -> tuple[float, float, str]:
     """
-    Scan thresholds on a held-out slice (last 20% of training data) and pick
+    Scan thresholds on explicitly supplied unseen validation data and pick
     the one that achieves >= target_precision with maximum recall.
 
     Returns (recommended_threshold, top_decile_threshold, notes_string).
@@ -299,10 +300,9 @@ def compute_recommended_threshold(
     """
     from sklearn.metrics import precision_score
 
-    n   = len(X)
-    cut = int(n * 0.8)
-    X_holdout = X.iloc[cut:][_MODEL_FEATURES]
-    y_holdout = y.iloc[cut:].to_numpy()
+    cols = _MODEL_FEATURES if feature_cols is None else feature_cols
+    X_holdout = X[cols]
+    y_holdout = y.to_numpy()
     if len(X_holdout) < 100:
         return 0.55, 0.5, 'holdout too small — using static 0.55 default'
 
@@ -331,24 +331,51 @@ def compute_recommended_threshold(
     return best_thresh, top_decile_threshold, notes
 
 
+def fit_with_threshold_holdout(X, y, sample_weights=None, feature_cols=None):
+    """Fit on the first 80% of timestamps; reserve the rest for threshold tuning.
+
+    Keep all symbols at a timestamp together and purge fit labels ending at or
+    after validation starts. Preserve this fitted model: refitting on validation
+    data would invalidate the threshold selected for it. Requires label-end t1.
+    """
+    if not isinstance(X.index, pd.DatetimeIndex) or not X.index.equals(y.index):
+        raise ValueError('Features and labels must have matching datetime indexes')
+    if 't1' not in X or X['t1'].isna().any():
+        raise ValueError('Valid t1 label-end timestamps are required for purging')
+    if sample_weights is not None and len(sample_weights) != len(X):
+        raise ValueError('Sample weights must match the feature rows')
+    times = X.index.unique().sort_values()
+    cut = int(len(times) * 0.8)
+    if cut == 0 or cut >= len(times):
+        raise ValueError('Insufficient timestamps for a threshold holdout')
+    boundary = times[cut]
+    fit_mask = (X.index < boundary) & (pd.to_datetime(X['t1']) < boundary)
+    hold_mask = X.index >= boundary
+    X_fit, y_fit = X.loc[fit_mask], y.loc[fit_mask]
+    if len(X_fit) == 0 or y_fit.nunique() < 2:
+        raise ValueError('Purged fitting data must contain both label classes')
+    cols = _MODEL_FEATURES if feature_cols is None else feature_cols
+    weights = None if sample_weights is None else np.asarray(sample_weights)[fit_mask]
+    tp_rate = float(y_fit.mean())
+    model = _wrap_calibrated(build_model(tp_rate=tp_rate), X_fit[cols],
+                             y_fit.to_numpy(), sample_weight=weights)
+    threshold, top10, notes = compute_recommended_threshold(
+        model, X.loc[hold_mask], y.loc[hold_mask], feature_cols=cols,
+    )
+    return model, threshold, top10, notes, len(X_fit), tp_rate
+
+
 def train_final_model(
     X: pd.DataFrame,
     y: pd.Series,
     cv_metrics: list,
     sample_weights: np.ndarray = None,
 ) -> ModelBundle:
-    """Train on the full labeled dataset and save to ML_MODEL_PATH."""
+    """Fit on earlier data, tune on unseen later data, and save without refitting."""
     import joblib
 
-    tp_rate = float(y.mean())
-    base    = build_model(tp_rate=tp_rate)
-    model   = _wrap_calibrated(base, X[_MODEL_FEATURES], y.to_numpy(),
-                                sample_weight=sample_weights)
-
-    # Pick a production threshold tuned to the actual probability distribution
-    # this model produces. Replaces the static ML_CONFIDENCE_THRESHOLD.
-    rec_thr, top10_thr, notes = compute_recommended_threshold(
-        model, X, y, target_precision=0.50,
+    model, rec_thr, top10_thr, notes, n_fit, tp_rate = fit_with_threshold_holdout(
+        X, y, sample_weights=sample_weights,
     )
     print(f'[train] Recommended production threshold: {rec_thr:.3f}  '
           f'(top-10% threshold: {top10_thr:.3f})')
@@ -358,11 +385,11 @@ def train_final_model(
         model=model,
         feature_cols=_MODEL_FEATURES,   # 10-feature Wave D subset (ablation winner)
         trained_at=datetime.now().isoformat(),
-        n_samples=len(X),
+        n_samples=n_fit,
         tp_rate=round(tp_rate, 4),
         cv_metrics=cv_metrics,
         calibrated=ML_CALIBRATION_METHOD is not None,
-        method=type(base).__name__,
+        method=type(model).__name__,
         recommended_threshold=rec_thr,
         target_precision=0.50,
         top_decile_threshold=top10_thr,
@@ -372,7 +399,7 @@ def train_final_model(
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     joblib.dump(bundle, ML_MODEL_PATH)
     print(f'[train] Model saved -> {ML_MODEL_PATH}  '
-          f'({len(X):,} samples, TP rate {tp_rate:.1%})')
+          f'({n_fit:,} fit samples, TP rate {tp_rate:.1%})')
 
     _print_feature_importance(model)
     return bundle

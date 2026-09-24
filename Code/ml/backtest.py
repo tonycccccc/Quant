@@ -397,7 +397,7 @@ def run_oos_backtest(
     Returns the same dict shape as run_backtest().
     """
     from ml.features import FEATURE_COLS, ML_TRAINING_FEATURES, compute_signal_score_col
-    from ml.train import build_model, _wrap_calibrated, compute_recommended_threshold
+    from ml.train import fit_with_threshold_holdout
     from config import ML_SIGNAL_SCORE_THRESHOLD
 
     print(f'\n[oos-backtest] Loading features from {ML_FEATURES_PATH}')
@@ -423,20 +423,12 @@ def run_oos_backtest(
             f'({(t_max - t_min).days / 30.4:.1f} months). Lower train_months.'
         )
 
-    train_df = labeled[labeled.index < cutoff]
+    train_df = labeled[(labeled.index < cutoff) & (labeled['t1'] < cutoff)]
     print(f'[oos-backtest] Train window: {t_min.date()} -> {cutoff.date()}  '
           f'({len(train_df):,} labeled rows)')
 
-    # Train a fresh model (no calibration / weights — match production config)
-    tp_rate = float(train_df['label'].mean())
-    print(f'[oos-backtest] Training on {len(train_df):,} samples '
-          f'(TP rate {tp_rate:.1%})...')
-    base = build_model(tp_rate=tp_rate)
-    model = _wrap_calibrated(base, train_df[ML_TRAINING_FEATURES], train_df['label'].to_numpy())
-
-    # Tune threshold on a holdout slice of training (NOT test) data
-    rec_thr, top10_thr, notes = compute_recommended_threshold(
-        model, train_df, train_df['label'], target_precision=0.50,
+    model, rec_thr, top10_thr, notes, _, _ = fit_with_threshold_holdout(
+        train_df, train_df['label'],
     )
     print(f'[oos-backtest] OOS-tuned threshold: {rec_thr:.3f}  ({notes})')
 
@@ -529,7 +521,7 @@ def run_walk_forward_oos(
     Returns dict with per-fold results AND aggregated mean/stdev metrics.
     """
     from ml.features import FEATURE_COLS, ML_TRAINING_FEATURES, compute_signal_score_col
-    from ml.train import build_model, _wrap_calibrated, compute_recommended_threshold
+    from ml.train import fit_with_threshold_holdout
     from config import ML_SIGNAL_SCORE_THRESHOLD
 
     print(f'\n[walk-forward-oos] Loading features from {ML_FEATURES_PATH}')
@@ -565,7 +557,9 @@ def run_walk_forward_oos(
         test_start = first_test_start + pd.DateOffset(months=fold_idx * test_months)
         test_end   = test_start       + pd.DateOffset(months=test_months)
 
-        train_df = labeled_filtered[labeled_filtered.index < test_start]
+        train_df = labeled_filtered[
+            (labeled_filtered.index < test_start) & (labeled_filtered['t1'] < test_start)
+        ]
         if len(train_df) < 2000:
             print(f'  Fold {fold_idx+1}: skipped (only {len(train_df)} training rows)')
             continue
@@ -577,12 +571,9 @@ def run_walk_forward_oos(
               f'train < {test_start.date()}  |  test [{test_start.date()} -> {test_end.date()})')
         print(f'  Train: {len(train_df):,} rows  |  Test feature window: {len(oos_features):,} rows')
 
-        # Train fresh model — use ablation-winner 10-feature subset
-        tp_rate = float(train_df['label'].mean())
-        base    = build_model(tp_rate=tp_rate)
-        model   = _wrap_calibrated(base, train_df[ML_TRAINING_FEATURES], train_df['label'].to_numpy())
-        rec_thr, _, _ = compute_recommended_threshold(model, train_df, train_df['label'],
-                                                       target_precision=0.50)
+        model, rec_thr, _, _, _, _ = fit_with_threshold_holdout(
+            train_df, train_df['label'],
+        )
 
         # Benchmark on this fold's test window
         qqq_ret = _benchmark_return(raw_bars.loc['QQQ'], test_start, test_end) if 'QQQ' in raw_bars.index.get_level_values(0) else 0.0

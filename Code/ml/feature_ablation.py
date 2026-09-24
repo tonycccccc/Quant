@@ -66,38 +66,12 @@ def _train_one_wave(features_df: pd.DataFrame, feature_cols: list) -> tuple:
     Train an in-memory model on the given feature subset.
     Returns (model, tuned_threshold).
     """
-    from ml.train import build_model, _wrap_calibrated, compute_recommended_threshold
+    from ml.train import fit_with_threshold_holdout
 
-    y = features_df['label']
-    X = features_df
-
-    tp_rate = float(y.mean())
-    base    = build_model(tp_rate=tp_rate)
-    # Use just the wave's features (subset of FEATURE_COLS)
-    model = _wrap_calibrated(base, X[feature_cols], y.to_numpy(), sample_weight=None)
-
-    # Threshold tuned on holdout
-    rec_thr, _, _ = compute_recommended_threshold(
-        model, X.assign(**{c: X[c] for c in feature_cols}),
-        y, target_precision=0.50,
-    ) if False else (None, None, None)
-    # compute_recommended_threshold uses FEATURE_COLS globally — reimplement
-    # here for arbitrary feature_cols
-    from sklearn.metrics import precision_score
-    n   = len(X)
-    cut = int(n * 0.8)
-    y_prob = model.predict_proba(X.iloc[cut:][feature_cols])[:, 1]
-    y_hold = y.iloc[cut:].to_numpy()
-    rec_thr = 0.5
-    for thr in np.linspace(0.1, 0.95, 86):
-        y_pred = (y_prob >= thr).astype(int)
-        if y_pred.sum() < max(20, len(y_hold) * 0.005):
-            continue
-        prec = precision_score(y_hold, y_pred, zero_division=0)
-        if prec >= 0.50:
-            rec_thr = float(thr)
-            break
-    return model, rec_thr
+    model, threshold, _, _, _, _ = fit_with_threshold_holdout(
+        features_df, features_df['label'], feature_cols=feature_cols,
+    )
+    return model, threshold
 
 
 def _walk_forward_wave(features_df: pd.DataFrame, raw_bars: pd.DataFrame,
@@ -108,7 +82,6 @@ def _walk_forward_wave(features_df: pd.DataFrame, raw_bars: pd.DataFrame,
     runs rule_plus_ml backtest. Returns aggregate metrics.
     """
     from ml.backtest import run_variant, _benchmark_return
-    from ml.train import build_model, _wrap_calibrated
 
     labeled = features_df[features_df['label'].notna()].copy()
     labeled['label'] = labeled['label'].astype(int)
@@ -124,28 +97,11 @@ def _walk_forward_wave(features_df: pd.DataFrame, raw_bars: pd.DataFrame,
         test_start = first_test_start + pd.DateOffset(months=fold_idx * test_months)
         test_end   = test_start       + pd.DateOffset(months=test_months)
 
-        train_df = labeled[labeled.index < test_start]
+        train_df = labeled[(labeled.index < test_start) & (labeled['t1'] < test_start)]
         if len(train_df) < 2000:
             continue
 
-        tp_rate = float(train_df['label'].mean())
-        base    = build_model(tp_rate=tp_rate)
-        model   = _wrap_calibrated(base, train_df[feature_cols], train_df['label'].to_numpy())
-
-        # Tune threshold on holdout slice of training
-        cut = int(len(train_df) * 0.8)
-        y_prob = model.predict_proba(train_df.iloc[cut:][feature_cols])[:, 1]
-        y_hold = train_df['label'].iloc[cut:].to_numpy()
-        rec_thr = 0.5
-        from sklearn.metrics import precision_score
-        for thr in np.linspace(0.1, 0.95, 86):
-            y_pred = (y_prob >= thr).astype(int)
-            if y_pred.sum() < max(20, len(y_hold) * 0.005):
-                continue
-            prec = precision_score(y_hold, y_pred, zero_division=0)
-            if prec >= 0.50:
-                rec_thr = float(thr)
-                break
+        model, rec_thr = _train_one_wave(train_df, feature_cols)
 
         oos_feat = features_df[(features_df.index >= test_start) & (features_df.index < test_end)]
         oos_feat = oos_feat[oos_feat['symbol'].isin(WATCHLIST.keys())]
